@@ -338,7 +338,11 @@ app.post("/clients", authenticateToken, async (req, res) => {
 // GET ALL CLIENTS (with pagination and filtering)
 app.get("/clients", authenticateToken, async (req, res) => {
   try {
+<<<<<<< HEAD
     const { status, search, page = 1, limit =  100 } = req.query;
+=======
+    const { status, search, page = 1, limit = 20 } = req.query;
+>>>>>>> 4bb2e8fd9545cfb6596c9edc642948149a5d7991
     const offset = (page - 1) * limit;
 
     let query = "SELECT * FROM clients WHERE created_by = $1";
@@ -458,6 +462,34 @@ app.delete("/clients/:id", authenticateToken, async (req, res) => {
 // ============================================
 
 // CREATE LOCATION LOG
+<<<<<<< HEAD
+=======
+app.post("/location-logs", authenticateToken, async (req, res) => {
+  try {
+    const { latitude, longitude, accuracy, activity, notes } = req.body;
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: "LocationRequired" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO location_logs (user_id, latitude, longitude, accuracy, activity, notes)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [req.user.id, latitude, longitude, accuracy || null, activity || null, notes || null]
+    );
+
+    res.status(201).json({
+      message: "LocationLogged",
+      log: result.rows[0],
+    });
+  } catch (err) {
+    console.error("CREATE LOCATION LOG ERROR:", err);
+    res.status(500).json({ error: "CreateLocationLogFailed" });
+  }
+});
+
+>>>>>>> 4bb2e8fd9545cfb6596c9edc642948149a5d7991
 // GET LOCATION LOGS (with date filtering)
 app.get("/location-logs", authenticateToken, async (req, res) => {
   try {
@@ -485,6 +517,7 @@ app.get("/location-logs", authenticateToken, async (req, res) => {
 
     const result = await pool.query(query, params);
 
+<<<<<<< HEAD
     // 🔧 Map snake_case columns to camelCase for app
     const mappedLogs = result.rows.map(log => ({
       id: log.id,
@@ -499,6 +532,10 @@ app.get("/location-logs", authenticateToken, async (req, res) => {
 
     res.json({
       logs: mappedLogs,                // ← Use mapped data
+=======
+    res.json({
+      logs: result.rows,
+>>>>>>> 4bb2e8fd9545cfb6596c9edc642948149a5d7991
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -510,6 +547,7 @@ app.get("/location-logs", authenticateToken, async (req, res) => {
   }
 });
 
+<<<<<<< HEAD
 
 //============================================
 // LOCATION POST
@@ -862,6 +900,8 @@ app.post("/api/sync/trigger", authenticateToken, async (req, res) => {
 
 
 
+=======
+>>>>>>> 4bb2e8fd9545cfb6596c9edc642948149a5d7991
 // ============================================
 // UTILITY ROUTES
 // ============================================
