@@ -8,7 +8,14 @@ import multer from "multer";
 import { pool } from "./db.js";
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: "*",                                      // or your specific dashboard URL
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+// Handle preflight requests
+app.options("*", cors());
 app.use(express.json());
 
 
@@ -123,6 +130,13 @@ const authenticateToken = (req, res, next) => {
 };
 
 console.log("ðŸ”§ Registering routes...");
+
+const requireAdmin = (req, res, next) => {
+  if (!req.user || !req.user.isAdmin) {
+    return res.status(403).json({ error: "AdminOnly" });
+  }
+  next();
+};
 // ============================================
 // XLSX UPLOAD ROUTE
 // ============================================
@@ -258,6 +272,7 @@ app.post(
 );
 
 
+
 // LOGIN
 app.post("/auth/login", async (req, res) => {
   try {
@@ -286,9 +301,16 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "InvalidCredentials" });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, {
-      expiresIn: "7d",
-    });
+    const token = jwt.sign(
+  {
+    id: user.id,
+    email: user.email,
+    isAdmin: user.is_admin   // <— REQUIRED
+  },
+  JWT_SECRET,
+  { expiresIn: "7d" }
+);
+
 
     res.json({
       message: "LoginSuccess",
@@ -307,6 +329,68 @@ app.post("/auth/login", async (req, res) => {
     res.status(500).json({ error: "LoginFailed" });
   }
 });
+
+
+
+// REGISTER — used by mobile app
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "MissingFields" });
+    }
+
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "EmailAlreadyExists" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const userResult = await pool.query(
+      `INSERT INTO users (email, password, is_admin)
+       VALUES ($1, $2, false)
+       RETURNING id, email`,
+      [email, hashedPassword]
+    );
+
+    const user = userResult.rows[0];
+
+    // Optional profile row
+    await pool.query(
+      `INSERT INTO profiles (user_id) VALUES ($1)`,
+      [user.id]
+    );
+
+    // Issue JWT immediately
+    const token = jwt.sign(
+  {
+    id: user.id,
+    email: user.email,
+    isAdmin: user.is_admin   // <— THIS MUST BE INCLUDED
+  },
+  JWT_SECRET,
+  { expiresIn: "7d" }
+);
+
+
+    res.status(201).json({
+      message: "SignupSuccess",
+      token,
+      user,
+    });
+  } catch (err) {
+    console.error("SIGNUP ERROR:", err);
+    res.status(500).json({ error: "SignupFailed" });
+  }
+});
+
+
 
 // FORGOT PASSWORD
 app.post("/auth/forgot-password", async (req, res) => {
@@ -621,7 +705,8 @@ app.delete("/clients/:id", authenticateToken, async (req, res) => {
 // CREATE LOCATION LOG (with automatic pincode detection)
 app.post("/location-logs", authenticateToken, async (req, res) => {
   try {
-    const { latitude, longitude, accuracy, activity, notes } = req.body;
+    const { latitude, longitude, accuracy, activity, notes, battery } = req.body;
+
 
     if (!latitude || !longitude) {
       return res.status(400).json({ error: "LocationRequired" });
@@ -633,10 +718,13 @@ app.post("/location-logs", authenticateToken, async (req, res) => {
     const pincode = await getPincodeFromCoordinates(latitude, longitude);
 
     const result = await pool.query(
-      `INSERT INTO location_logs (user_id, latitude, longitude, accuracy, activity, notes, pincode)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [req.user.id, latitude, longitude, accuracy || null, activity || null, notes || null, pincode]
+      `INSERT INTO location_logs (user_id, latitude, longitude, accuracy, activity, notes, pincode, battery)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *
+`,
+      [req.user.id, latitude, longitude, accuracy || null, activity || null, notes || null, pincode, battery || null
+]
+
     );
 
     const log = result.rows[0];
@@ -646,11 +734,13 @@ app.post("/location-logs", authenticateToken, async (req, res) => {
       latitude: log.latitude,
       longitude: log.longitude,
       accuracy: log.accuracy,
+      battery: log.battery,
       activity: log.activity,
       notes: log.notes,
       pincode: log.pincode,
       timestamp: log.timestamp
     };
+    console.log(`🔋 Battery logged for user ${req.user.id}: ${battery}% @ ${latitude}, ${longitude}`);
 
     console.log(`âœ… Location logged with pincode: ${pincode}`);
 
@@ -1385,6 +1475,278 @@ app.post("/api/sync/trigger", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "TriggerSyncFailed" });
   }
 });
+
+
+
+// ============================================
+// ADMIN ROUTES - Get ALL data (no filtering)
+// ============================================
+
+// GET ALL CLIENTS (ADMIN - No pincode filter)
+app.get("/admin/clients", authenticateToken, async (req, res) => {
+  try {
+    const { status, search, page = 1, limit = 1000 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log(`📊 Admin fetching ALL clients`);
+
+    // Build query - NO PINCODE FILTER
+    let query = "SELECT * FROM clients WHERE 1=1";
+    const params = [];
+    let paramCount = 0;
+
+    // Additional filters
+    if (status) {
+      paramCount++;
+      query += ` AND status = $${paramCount}`;
+      params.push(status);
+    }
+
+    if (search) {
+      paramCount++;
+      query += ` AND (name ILIKE $${paramCount} OR email ILIKE $${paramCount} OR phone ILIKE $${paramCount})`;
+      params.push(`%${search}%`);
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+
+    const result = await pool.query(query, params);
+
+    // Get total count
+    let countQuery = "SELECT COUNT(*) FROM clients WHERE 1=1";
+    const countParams = [];
+    let countParamIndex = 0;
+
+    if (status) {
+      countParamIndex++;
+      countQuery += ` AND status = $${countParamIndex}`;
+      countParams.push(status);
+    }
+
+    const countResult = await pool.query(countQuery, countParams);
+    const total = parseInt(countResult.rows[0].count);
+
+    console.log(`✅ Admin found ${result.rows.length} clients (total: ${total})`);
+
+    res.json({
+      clients: result.rows,
+      isAdmin: true,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (err) {
+    console.error("GET ADMIN CLIENTS ERROR:", err);
+    res.status(500).json({ error: "GetAdminClientsFailed" });
+  }
+});
+
+// GET ALL USERS (ADMIN)
+app.get("/admin/users", authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 100 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log(`📊 Admin fetching ALL users`);
+
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.created_at, u.pincode,
+              p.full_name, p.department, p.work_hours_start, p.work_hours_end
+       FROM users u
+       LEFT JOIN profiles p ON u.id = p.user_id
+       ORDER BY u.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    const countResult = await pool.query("SELECT COUNT(*) FROM users");
+    const total = parseInt(countResult.rows[0].count);
+
+    console.log(`✅ Admin found ${result.rows.length} users (total: ${total})`);
+
+    res.json({
+      users: result.rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (err) {
+    console.error("GET ADMIN USERS ERROR:", err);
+    res.status(500).json({ error: "GetAdminUsersFailed" });
+  }
+});
+
+// GET ADMIN ANALYTICS (ALL data)
+app.get("/admin/analytics", authenticateToken, async (req, res) => {
+  try {
+    console.log(`📊 Admin fetching analytics`);
+
+    // Get client stats
+    const clientStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_clients,
+        COUNT(CASE WHEN status = 'active' THEN 1 END) as active_clients,
+        COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 END) as clients_with_location,
+        COUNT(DISTINCT pincode) as unique_pincodes
+      FROM clients
+    `);
+
+    // Get user stats
+    const userStats = await pool.query(`
+      SELECT COUNT(*) as total_users
+      FROM users
+    `);
+
+    // Get location logs count
+    const locationStats = await pool.query(`
+      SELECT COUNT(*) as total_logs
+      FROM location_logs
+    `);
+
+    res.json({
+      clients: clientStats.rows[0],
+      users: userStats.rows[0],
+      locations: locationStats.rows[0],
+    });
+  } catch (err) {
+    console.error("GET ADMIN ANALYTICS ERROR:", err);
+    res.status(500).json({ error: "GetAdminAnalyticsFailed" });
+  }
+});
+
+// Add this near the end of server.js, before app.listen()
+
+// ============================================
+// ADMIN ROUTES - Get ALL data (no filtering)
+// ============================================
+
+// GET ALL CLIENTS (ADMIN - No pincode filter)
+app.get("/admin/clients", authenticateToken, async (req, res) => {
+  try {
+    const { status, search, page = 1, limit = 1000 } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = "SELECT * FROM clients WHERE 1=1";
+    const params = [];
+    let paramCount = 0;
+
+    if (status) {
+      paramCount++;
+      query += ` AND status = $${paramCount}`;
+      params.push(status);
+    }
+
+    if (search) {
+      paramCount++;
+      query += ` AND (name ILIKE $${paramCount} OR email ILIKE $${paramCount})`;
+      params.push(`%${search}%`);
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+
+    const result = await pool.query(query, params);
+    const countResult = await pool.query("SELECT COUNT(*) FROM clients");
+    const total = parseInt(countResult.rows[0].count);
+
+    res.json({
+      clients: result.rows,
+      pagination: { page: parseInt(page), limit: parseInt(limit), total, totalPages: Math.ceil(total / limit) }
+    });
+  } catch (err) {
+    console.error("ADMIN CLIENTS ERROR:", err);
+    res.status(500).json({ error: "GetAdminClientsFailed" });
+  }
+});
+
+// GET ALL USERS (ADMIN)
+app.get("/admin/users", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.created_at, u.pincode,
+              p.full_name, p.department, p.work_hours_start, p.work_hours_end
+       FROM users u
+       LEFT JOIN profiles p ON u.id = p.user_id
+       ORDER BY u.created_at DESC`
+    );
+
+    res.json({ users: result.rows });
+  } catch (err) {
+    console.error("ADMIN USERS ERROR:", err);
+    res.status(500).json({ error: "GetAdminUsersFailed" });
+  }
+});
+
+// GET ADMIN ANALYTICS
+app.get("/admin/analytics", authenticateToken, async (req, res) => {
+  try {
+    const clientStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_clients,
+        COUNT(CASE WHEN status = 'active' THEN 1 END) as active_clients,
+        COUNT(CASE WHEN latitude IS NOT NULL THEN 1 END) as clients_with_location,
+        COUNT(DISTINCT pincode) as unique_pincodes
+      FROM clients
+    `);
+
+    const userStats = await pool.query(`SELECT COUNT(*) as total_users FROM users`);
+    const locationStats = await pool.query(`SELECT COUNT(*) as total_logs FROM location_logs`);
+
+    res.json({
+      clients: clientStats.rows[0],
+      users: userStats.rows[0],
+      locations: locationStats.rows[0]
+    });
+  } catch (err) {
+    console.error("ADMIN ANALYTICS ERROR:", err);
+    res.status(500).json({ error: "GetAdminAnalyticsFailed" });
+  }
+});
+
+app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 200 } = req.query;
+    const offset = (page - 1) * limit;
+    const userId = req.params.userId;
+
+    const result = await pool.query(
+      `SELECT id, latitude, longitude, accuracy, activity,battery, notes, pincode, timestamp
+       FROM location_logs
+       WHERE user_id = $1
+       ORDER BY timestamp DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+
+    const countResult = await pool.query(
+      "SELECT COUNT(*) FROM location_logs WHERE user_id = $1",
+      [userId]
+    );
+
+    res.json({
+      logs: result.rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(countResult.rows[0].count),
+        totalPages: Math.ceil(countResult.rows[0].count / limit),
+      }
+    });
+
+  } catch (err) {
+    console.error("GET ADMIN LOCATION LOGS ERROR:", err);
+    res.status(500).json({ error: "GetAdminLocationLogsFailed" });
+  }
+});
+
+
 
 // Start server
 app.listen(PORT, () => {
