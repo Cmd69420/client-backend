@@ -120,13 +120,22 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: "AccessTokenRequired" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: "InvalidToken" });
-    }
-    req.user = user;
-    next();
-  });
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+  if (err) return res.status(403).json({ error: "InvalidToken" });
+
+  const result = await pool.query(
+    `SELECT * FROM user_sessions WHERE token = $1 AND expires_at > NOW()`,
+    [token]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(401).json({ error: "SessionExpired" });
+  }
+
+  req.user = decoded;
+  next();
+});
+
 };
 
 console.log("ðŸ”§ Registering routes...");
@@ -311,6 +320,13 @@ app.post("/auth/login", async (req, res) => {
   { expiresIn: "7d" }
 );
 
+  // Save token to server sessions table
+await pool.query(
+  `INSERT INTO user_sessions (user_id, token, expires_at)
+   VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+  [user.id, token]
+);
+
 
     res.json({
       message: "LoginSuccess",
@@ -329,6 +345,16 @@ app.post("/auth/login", async (req, res) => {
     res.status(500).json({ error: "LoginFailed" });
   }
 });
+
+
+app.post("/auth/logout", authenticateToken, async (req, res) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  await pool.query(`DELETE FROM user_sessions WHERE token = $1`, [token]);
+  res.json({ message: "LogoutSuccess" });
+});
+
 
 
 
@@ -518,6 +544,24 @@ app.put("/auth/profile", authenticateToken, async (req, res) => {
 // CLIENTS ROUTES (WITH PINCODE FILTERING)
 // ============================================
 
+
+app.post("/auth/clear-pincode", authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users SET pincode = NULL WHERE id = $1`,
+      [req.user.id]
+    );
+    console.log(`🛑 Tracking stopped → cleared pincode for ${req.user.id}`);
+    res.json({ message: "PincodeCleared" });
+  } catch (err) {
+    res.status(500).json({ error: "ClearPincodeFailed" });
+  }
+});
+
+
+
+
+
 // CREATE CLIENT (with pincode auto-calculation)
 app.post("/clients", authenticateToken, async (req, res) => {
   try {
@@ -572,9 +616,15 @@ app.get("/clients", authenticateToken, async (req, res) => {
     console.log(`ðŸ“ Filtering clients by pincode: ${userPincode}`);
 
     // Build query - FILTER BY PINCODE
-    let query = "SELECT * FROM clients WHERE pincode = $1";
-    const params = [userPincode];
-    let paramCount = 1;
+   let query = `
+  SELECT *
+  FROM clients
+  WHERE pincode = $1
+  AND (created_by IS NULL OR created_by = $2)
+`;
+const params = [userPincode, req.user.id];
+let paramCount = 2;
+
 
     // Additional filters
     if (status) {
@@ -726,6 +776,23 @@ app.post("/location-logs", authenticateToken, async (req, res) => {
 ]
 
     );
+
+    // 🔄 update user's pincode based on latest location
+    if (pincode) {
+      await pool.query(
+        `UPDATE users SET pincode = $1 WHERE id = $2 AND pincode IS DISTINCT FROM $1`,
+        [pincode, req.user.id]
+      );
+      console.log(`📍 Updated user pincode to ${pincode} for user ${req.user.id}`);
+    }
+
+
+    await pool.query(
+                 `UPDATE users
+                  SET pincode = $1
+                  WHERE id = $2 AND pincode IS NULL`,
+    [pincode, req.user.id]
+);
 
     const log = result.rows[0];
     const mappedLog = {
@@ -1312,7 +1379,7 @@ app.post("/api/sync/cleanup-duplicates", authenticateMiddleware, async (req, res
       const insertResult = await client.query(
         `INSERT INTO clients 
          (name, email, phone, address, latitude, longitude, status, notes, pincode, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '8eaf9602-c9f1-4e13-8aa5-988e93896d6a')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
          RETURNING id`,
         [name, email, phone, address, latitude, longitude, status, notes, pincode]
       );
@@ -1743,6 +1810,29 @@ app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (
   } catch (err) {
     console.error("GET ADMIN LOCATION LOGS ERROR:", err);
     res.status(500).json({ error: "GetAdminLocationLogsFailed" });
+  }
+});
+
+
+app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT latitude, longitude, timestamp
+       FROM location_logs
+       WHERE user_id = $1
+         AND DATE(timestamp) = CURRENT_DATE
+       ORDER BY timestamp ASC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ clockIn: null });
+    }
+
+    res.json({ clockIn: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: "ClockInFetchFailed" });
   }
 });
 
