@@ -147,9 +147,8 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 // ============================================
-// FIXED: MATCHES YOUR EXACT EXCEL COLUMNS
+// FIXED: Proper type casting for PostgreSQL
 // ============================================
-// Columns: name, email, phone, address, latitude, longitude, status, note, source, pincode
 
 app.post(
   "/clients/upload-excel",
@@ -186,16 +185,14 @@ app.post(
       let skipped = 0;
 
       for (const row of rows) {
-        // ✅ FIXED: Match exact Excel column names (case-insensitive)
         const name = row.name || row.Name || null;
         const email = row.email || row.Email || null;
         const phone = row.phone || row.Phone || null;
         const address = row.address || row.Address || null;
-        const note = row.note || row.Note || row.notes || row.Notes || null;  // ✅ singular 'note'
+        const note = row.note || row.Note || row.notes || row.Notes || null;
         const status = row.status || row.Status || 'active';
         const source = row.source || row.Source || 'excel';
 
-        // Parse coordinates (handle both string and number formats)
         let latitude = null;
         let longitude = null;
         let pincode = null;
@@ -214,28 +211,24 @@ app.post(
           pincode = String(row.pincode || row.Pincode).trim();
         }
 
-        // Skip if no name or address
         if (!name || !address) {
           skipped++;
-          console.log(`⏭️ Skipped: Missing name or address -`, { name, address });
           continue;
         }
 
-        // Geocode if coordinates missing but pincode exists
+        // Geocode if needed
         if (pincode && (!latitude || !longitude)) {
           try {
             const geo = await getCoordinatesFromPincode(pincode);
             if (geo) {
               latitude = geo.latitude;
               longitude = geo.longitude;
-              console.log(`📍 Geocoded from pincode ${pincode}: ${latitude}, ${longitude}`);
             }
           } catch (err) {
             console.log(`⚠️ Geocoding failed for pincode ${pincode}`);
           }
         }
 
-        // Geocode from address if still no coordinates
         if (!pincode && address && (!latitude || !longitude)) {
           try {
             const geo = await getCoordinatesFromAddress(address);
@@ -243,76 +236,85 @@ app.post(
               latitude = latitude ?? geo.latitude;
               longitude = longitude ?? geo.longitude;
               pincode = pincode ?? geo.pincode;
-              console.log(`📍 Geocoded from address: ${latitude}, ${longitude}, ${pincode}`);
             }
           } catch (err) {
-            console.log(`⚠️ Geocoding failed for address: ${address}`);
+            console.log(`⚠️ Geocoding failed for address`);
           }
         }
 
         // ============================================
-        // DUPLICATE CHECK
+        // SIMPLIFIED DUPLICATE CHECK WITH EXPLICIT TYPES
         // ============================================
-        const checkQuery = `
-          SELECT id, name, email, phone, created_at
-          FROM clients
-          WHERE 
-            -- Match by cleaned name + pincode
-            (
-              LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = 
-              LOWER(TRIM(REGEXP_REPLACE($1, '[^a-zA-Z0-9\\s]', '', 'g')))
-              AND (pincode = $2 OR ($2 IS NULL AND pincode IS NULL))
-            )
-            
-            -- OR exact email match
-            OR (
-              $3 IS NOT NULL 
-              AND email IS NOT NULL 
-              AND LOWER(TRIM(email)) = LOWER(TRIM($3))
-            )
-            
-            -- OR phone match (digits only)
-            OR (
-              $4 IS NOT NULL 
-              AND phone IS NOT NULL 
-              AND REGEXP_REPLACE(phone, '\\D', '', 'g') = REGEXP_REPLACE($4, '\\D', '', 'g')
-            )
-          LIMIT 1
-        `;
-
-        const duplicateCheck = await client.query(checkQuery, [
-          name, 
-          pincode, 
-          email, 
-          phone
-        ]);
+        
+        // Option 1: Check by email first (most reliable)
+        let duplicateCheck = { rows: [] };
+        
+        if (email) {
+          duplicateCheck = await client.query(
+            `SELECT id FROM clients WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) LIMIT 1`,
+            [email]
+          );
+        }
+        
+        // Option 2: Check by phone if no email match
+        if (duplicateCheck.rows.length === 0 && phone) {
+          const cleanPhone = phone.replace(/\D/g, ''); // Remove non-digits
+          duplicateCheck = await client.query(
+            `SELECT id FROM clients 
+             WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 
+             LIMIT 1`,
+            [cleanPhone]
+          );
+        }
+        
+        // Option 3: Check by name + pincode if still no match
+        if (duplicateCheck.rows.length === 0) {
+          const cleanName = name.toLowerCase().trim().replace(/[^a-z0-9\s]/g, '');
+          
+          if (pincode) {
+            duplicateCheck = await client.query(
+              `SELECT id FROM clients 
+               WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1 
+               AND pincode = $2
+               LIMIT 1`,
+              [cleanName, pincode]
+            );
+          } else {
+            duplicateCheck = await client.query(
+              `SELECT id FROM clients 
+               WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1
+               LIMIT 1`,
+              [cleanName]
+            );
+          }
+        }
 
         if (duplicateCheck.rows.length > 0) {
-          // DUPLICATE FOUND - Update existing
+          // DUPLICATE FOUND - Update
           const existingId = duplicateCheck.rows[0].id;
           
           await client.query(
             `UPDATE clients 
              SET 
-               email = COALESCE($1::VARCHAR, email),
-               phone = COALESCE($2::VARCHAR, phone),
-               address = COALESCE($3::VARCHAR, address),
-               latitude = COALESCE($4::DOUBLE PRECISION, latitude),
-               longitude = COALESCE($5::DOUBLE PRECISION, longitude),
-               pincode = COALESCE($6::VARCHAR, pincode),
-               notes = COALESCE($7::TEXT, notes),
-               status = COALESCE($8::VARCHAR, status),
+               email = COALESCE($1, email),
+               phone = COALESCE($2, phone),
+               address = COALESCE($3, address),
+               latitude = COALESCE($4, latitude),
+               longitude = COALESCE($5, longitude),
+               pincode = COALESCE($6, pincode),
+               notes = COALESCE($7, notes),
+               status = $8,
                updated_at = NOW()
              WHERE id = $9`,
             [
-              email || null,
-              phone || null,
-              address || null,
-              latitude || null,
-              longitude || null,
-              pincode || null,
-              note || null,  // ✅ using 'note' from Excel
-              status || 'active',
+              email,
+              phone,
+              address,
+              latitude,
+              longitude,
+              pincode,
+              note,
+              status,
               existingId
             ]
           );
@@ -327,21 +329,21 @@ app.post(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [
               name,
-              email || null,
-              phone || null,
-              address || null,
-              latitude || null,
-              longitude || null,
-              status || 'active',
-              note || null,  // ✅ using 'note' from Excel
+              email,
+              phone,
+              address,
+              latitude,
+              longitude,
+              status,
+              note,
               req.user.id,
-              source || 'excel',
-              pincode || null
+              source,
+              pincode
             ]
           );
 
           imported++;
-          console.log(`✅ Imported: ${name} | Pincode: ${pincode || 'N/A'}`);
+          console.log(`✅ Imported: ${name}`);
         }
       }
 
@@ -358,8 +360,7 @@ app.post(
 
       res.json({
         status: "OK",
-        summary,
-        message: `Successfully processed ${rows.length} rows: ${imported} new, ${updated} updated, ${skipped} skipped`
+        summary
       });
 
     } catch (error) {
