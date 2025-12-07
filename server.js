@@ -359,6 +359,7 @@ app.post("/auth/logout", authenticateToken, async (req, res) => {
 
 
 // REGISTER — used by mobile app
+// REGISTER – used by mobile app
 app.post("/auth/signup", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -395,15 +396,21 @@ app.post("/auth/signup", async (req, res) => {
 
     // Issue JWT immediately
     const token = jwt.sign(
-  {
-    id: user.id,
-    email: user.email,
-    isAdmin: user.is_admin   // <— THIS MUST BE INCLUDED
-  },
-  JWT_SECRET,
-  { expiresIn: "7d" }
-);
+      {
+        id: user.id,
+        email: user.email,
+        isAdmin: false
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
 
+    // ✅ FIX: Save token to user_sessions table (same as login)
+    await pool.query(
+      `INSERT INTO user_sessions (user_id, token, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+      [user.id, token]
+    );
 
     res.status(201).json({
       message: "SignupSuccess",
@@ -415,7 +422,6 @@ app.post("/auth/signup", async (req, res) => {
     res.status(500).json({ error: "SignupFailed" });
   }
 });
-
 
 
 // FORGOT PASSWORD
