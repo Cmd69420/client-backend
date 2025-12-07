@@ -146,29 +146,24 @@ const requireAdmin = (req, res, next) => {
   }
   next();
 };
+/// ============================================
+// REPLACE YOUR ENTIRE /clients/upload-excel ROUTE WITH THIS
 // ============================================
-// XLSX UPLOAD ROUTE
-// ============================================
+
 app.post(
   "/clients/upload-excel",
   authenticateToken,
   upload.single("file"),
   async (req, res) => {
+    const client = await pool.connect();
+    
     try {
       if (!req.file) {
-        console.log("❌ No file received");
         return res.status(400).json({ error: "NoFileUploaded" });
       }
 
-      console.log(
-        "📥 File received:",
-        req.file.originalname,
-        req.file.mimetype,
-        "| Size:",
-        req.file.size
-      );
+      console.log("📥 Upload started:", req.file.originalname, req.file.size, "bytes");
 
-      // Only XLSX allowed
       if (req.file.mimetype !== "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
         return res.status(400).json({ error: "OnlyXLSXAllowed" });
       }
@@ -178,12 +173,16 @@ app.post(
       const rows = xlsx.utils.sheet_to_json(sheet);
 
       if (rows.length === 0) {
-        console.log("⚠ Empty Excel file");
         return res.status(400).json({ error: "EmptyExcelFile" });
       }
 
-      console.log(`📌 Parsed clients for DB: ${rows.length}`);
-      const imported = [];
+      console.log(`📊 Processing ${rows.length} rows...`);
+
+      await client.query("BEGIN");
+
+      let imported = 0;
+      let updated = 0;
+      let skipped = 0;
 
       for (const row of rows) {
         const name = row.name || row.Name || row["First Name"] || null;
@@ -193,7 +192,7 @@ app.post(
         const notes = row.notes || row.Notes || null;
 
         if (!name || !address) {
-          console.log("⛔ Skipped because missing name/address", row);
+          skipped++;
           continue;
         }
 
@@ -201,14 +200,15 @@ app.post(
         let longitude = row.longitude || row.Longitude || null;
         let pincode = row.pincode || row.Pincode || null;
 
-        // Case 1: pincode exists → get lat/lng from geocode
+        // Geocode if needed
         if (pincode && (!latitude || !longitude)) {
-          const g = await getCoordinatesFromPincode(pincode);
-          latitude = g?.latitude ?? latitude;
-          longitude = g?.longitude ?? longitude;
+          const geo = await getCoordinatesFromPincode(pincode);
+          if (geo) {
+            latitude = geo.latitude;
+            longitude = geo.longitude;
+          }
         }
 
-        // Case 2: pincode missing → get lat/lng from address
         if (!pincode && address) {
           const geo = await getCoordinatesFromAddress(address);
           if (geo) {
@@ -218,69 +218,105 @@ app.post(
           }
         }
 
-        const client = await pool.query(
-          `
-          INSERT INTO clients
-          (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
-          VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,'excel',$9)
-          RETURNING *
-        `,
-          [
-            name,
-            email,
-            phone,
-            address,
-            latitude,
-            longitude,
-            notes,
-            req.user.id,
-            pincode,
-          ]
-        );
+        // ============================================
+        // DUPLICATE CHECK (Multiple criteria)
+        // ============================================
+        const checkQuery = `
+          SELECT id, name, email, phone, created_at
+          FROM clients
+          WHERE 
+            -- Match by name + pincode
+            (
+              LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = 
+              LOWER(TRIM(REGEXP_REPLACE($1, '[^a-zA-Z0-9\\s]', '', 'g')))
+              AND ($2::VARCHAR IS NULL OR pincode = $2)
+            )
+            
+            -- OR match by email (if both exist)
+            OR (
+              $3::VARCHAR IS NOT NULL 
+              AND email IS NOT NULL 
+              AND LOWER(TRIM(email)) = LOWER(TRIM($3))
+            )
+            
+            -- OR match by phone (if both exist)
+            OR (
+              $4::VARCHAR IS NOT NULL 
+              AND phone IS NOT NULL 
+              AND REGEXP_REPLACE(phone, '\\D', '', 'g') = REGEXP_REPLACE($4, '\\D', '', 'g')
+            )
+          LIMIT 1
+        `;
 
-        imported.push(client.rows[0]);
-      }
+        const duplicateCheck = await client.query(checkQuery, [name, pincode, email, phone]);
 
-      // =====================================================
-      // DUPLICATE CLEANUP (delete older with no coordinates)
-      // =====================================================
-      console.log("🧹 Running cleanup duplicates");
-      const groups = await pool.query(`
-        SELECT LOWER(name) AS key, array_agg(id) AS ids
-        FROM clients
-        GROUP BY LOWER(name)
-        HAVING COUNT(*) > 1
-      `);
+        if (duplicateCheck.rows.length > 0) {
+          // DUPLICATE FOUND - Update existing record
+          const existingId = duplicateCheck.rows[0].id;
+          
+          await client.query(
+            `UPDATE clients 
+             SET 
+               email = COALESCE($1, email),
+               phone = COALESCE($2, phone),
+               address = COALESCE($3, address),
+               latitude = COALESCE($4, latitude),
+               longitude = COALESCE($5, longitude),
+               pincode = COALESCE($6, pincode),
+               notes = CASE 
+                 WHEN $7 IS NOT NULL AND $7 != '' THEN $7 
+                 ELSE notes 
+               END,
+               status = 'active',
+               updated_at = NOW()
+             WHERE id = $8`,
+            [email, phone, address, latitude, longitude, pincode, notes, existingId]
+          );
 
-      for (const g of groups.rows) {
-        const ids = g.ids;
-        const clients = (
-          await pool.query(
-            `SELECT * FROM clients WHERE id = ANY($1) ORDER BY created_at DESC`,
-            [ids]
-          )
-        ).rows;
+          updated++;
+          console.log(`🔄 Updated: ${name} (ID: ${existingId})`);
+        } else {
+          // NO DUPLICATE - Insert new client
+          await client.query(
+            `INSERT INTO clients
+             (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
+             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, 'excel', $9)`,
+            [name, email, phone, address, latitude, longitude, notes, req.user.id, pincode]
+          );
 
-        const keeper = clients[0];
-        const toDelete = clients.slice(1).filter((c) => !c.latitude || !c.longitude);
-
-        for (const del of toDelete) {
-          await pool.query(`DELETE FROM clients WHERE id = $1`, [del.id]);
-          console.log(`🗑️ Deleted duplicate without coords: ${del.name}`);
+          imported++;
+          console.log(`✅ Imported: ${name}`);
         }
       }
 
-      console.log("✅ Upload + insertion completed");
-      res.json({ status: "OK", imported: imported.length });
+      await client.query("COMMIT");
+
+      const summary = {
+        total: rows.length,
+        imported,
+        updated,
+        skipped
+      };
+
+      console.log("✅ Upload completed:", summary);
+
+      res.json({
+        status: "OK",
+        summary
+      });
 
     } catch (error) {
-      console.error("❌ Upload Excel Error:", error);
-      res.status(500).json({ error: "UploadFailed", message: error.message });
+      await client.query("ROLLBACK");
+      console.error("❌ Upload error:", error);
+      res.status(500).json({ 
+        error: "UploadFailed", 
+        message: error.message 
+      });
+    } finally {
+      client.release();
     }
   }
 );
-
-
 
 // LOGIN
 app.post("/auth/login", async (req, res) => {
