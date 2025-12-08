@@ -1959,10 +1959,12 @@ app.get("/admin/clock-status", authenticateToken, requireAdmin, async (req, res)
 app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
   const result = await pool.query(`
     SELECT u.id,
-      COALESCE(SUM(e.amount), 0) AS total_expense,
-      COALESCE(SUM(CASE WHEN e.status = 'pending' THEN e.amount ELSE 0 END), 0) AS pending_expense
+      COALESCE(SUM(e.amount_spent), 0) AS total_expense,
+      COALESCE(SUM(
+        CASE WHEN e.status = 'pending' THEN e.amount_spent ELSE 0 END
+      ), 0) AS pending_expense
     FROM users u
-    LEFT JOIN expenses e ON e.user_id = u.id
+    LEFT JOIN trip_expenses e ON e.user_id = u.id
     GROUP BY u.id;
   `);
 
