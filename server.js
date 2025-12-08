@@ -10,8 +10,9 @@ import { pool } from "./db.js";
 const app = express();
 app.use(cors({
   origin: [
-    "http://localhost:3000",         // Local React dashboard // If you deploy later
-  ],                                     // or your specific dashboard URL
+    "http://localhost:3000",
+    "https://clientdashboard.onrender.com"    // Local React dashboard // If you deploy later
+  ],                                          // or your specific dashboard URL
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
