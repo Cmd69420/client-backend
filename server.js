@@ -147,28 +147,23 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 // ============================================
-// XLSX UPLOAD ROUTE
+// FIXED: Proper type casting for PostgreSQL
 // ============================================
+
 app.post(
   "/clients/upload-excel",
   authenticateToken,
   upload.single("file"),
   async (req, res) => {
+    const client = await pool.connect();
+    
     try {
       if (!req.file) {
-        console.log("❌ No file received");
         return res.status(400).json({ error: "NoFileUploaded" });
       }
 
-      console.log(
-        "📥 File received:",
-        req.file.originalname,
-        req.file.mimetype,
-        "| Size:",
-        req.file.size
-      );
+      console.log("📥 Upload started:", req.file.originalname, req.file.size, "bytes");
 
-      // Only XLSX allowed
       if (req.file.mimetype !== "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
         return res.status(400).json({ error: "OnlyXLSXAllowed" });
       }
@@ -178,109 +173,208 @@ app.post(
       const rows = xlsx.utils.sheet_to_json(sheet);
 
       if (rows.length === 0) {
-        console.log("⚠ Empty Excel file");
         return res.status(400).json({ error: "EmptyExcelFile" });
       }
 
-      console.log(`📌 Parsed clients for DB: ${rows.length}`);
-      const imported = [];
+      console.log(`📊 Processing ${rows.length} rows...`);
+
+      await client.query("BEGIN");
+
+      let imported = 0;
+      let updated = 0;
+      let skipped = 0;
 
       for (const row of rows) {
-        const name = row.name || row.Name || row["First Name"] || null;
+        const name = row.name || row.Name || null;
         const email = row.email || row.Email || null;
         const phone = row.phone || row.Phone || null;
         const address = row.address || row.Address || null;
-        const notes = row.notes || row.Notes || null;
+        const note = row.note || row.Note || row.notes || row.Notes || null;
+        const status = row.status || row.Status || 'active';
+        const source = row.source || row.Source || 'excel';
+
+        let latitude = null;
+        let longitude = null;
+        let pincode = null;
+
+        if (row.latitude || row.Latitude) {
+          latitude = parseFloat(row.latitude || row.Latitude);
+          if (isNaN(latitude)) latitude = null;
+        }
+
+        if (row.longitude || row.Longitude) {
+          longitude = parseFloat(row.longitude || row.Longitude);
+          if (isNaN(longitude)) longitude = null;
+        }
+
+        if (row.pincode || row.Pincode) {
+          pincode = String(row.pincode || row.Pincode).trim();
+        }
 
         if (!name || !address) {
-          console.log("⛔ Skipped because missing name/address", row);
+          skipped++;
           continue;
         }
 
-        let latitude = row.latitude || row.Latitude || null;
-        let longitude = row.longitude || row.Longitude || null;
-        let pincode = row.pincode || row.Pincode || null;
-
-        // Case 1: pincode exists → get lat/lng from geocode
+        // Geocode if needed
         if (pincode && (!latitude || !longitude)) {
-          const g = await getCoordinatesFromPincode(pincode);
-          latitude = g?.latitude ?? latitude;
-          longitude = g?.longitude ?? longitude;
-        }
-
-        // Case 2: pincode missing → get lat/lng from address
-        if (!pincode && address) {
-          const geo = await getCoordinatesFromAddress(address);
-          if (geo) {
-            latitude = latitude ?? geo.latitude;
-            longitude = longitude ?? geo.longitude;
-            pincode = pincode ?? geo.pincode;
+          try {
+            const geo = await getCoordinatesFromPincode(pincode);
+            if (geo) {
+              latitude = geo.latitude;
+              longitude = geo.longitude;
+            }
+          } catch (err) {
+            console.log(`⚠️ Geocoding failed for pincode ${pincode}`);
           }
         }
 
-        const client = await pool.query(
-          `
-          INSERT INTO clients
-          (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
-          VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,'excel',$9)
-          RETURNING *
-        `,
-          [
-            name,
-            email,
-            phone,
-            address,
-            latitude,
-            longitude,
-            notes,
-            req.user.id,
-            pincode,
-          ]
-        );
+        if (!pincode && address && (!latitude || !longitude)) {
+          try {
+            const geo = await getCoordinatesFromAddress(address);
+            if (geo) {
+              latitude = latitude ?? geo.latitude;
+              longitude = longitude ?? geo.longitude;
+              pincode = pincode ?? geo.pincode;
+            }
+          } catch (err) {
+            console.log(`⚠️ Geocoding failed for address`);
+          }
+        }
 
-        imported.push(client.rows[0]);
-      }
+        // ============================================
+        // SIMPLIFIED DUPLICATE CHECK WITH EXPLICIT TYPES
+        // ============================================
+        
+        // Option 1: Check by email first (most reliable)
+        let duplicateCheck = { rows: [] };
+        
+        if (email) {
+          duplicateCheck = await client.query(
+            `SELECT id FROM clients WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) LIMIT 1`,
+            [email]
+          );
+        }
+        
+        // Option 2: Check by phone if no email match
+        if (duplicateCheck.rows.length === 0 && phone) {
+          const cleanPhone = phone.replace(/\D/g, ''); // Remove non-digits
+          duplicateCheck = await client.query(
+            `SELECT id FROM clients 
+             WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 
+             LIMIT 1`,
+            [cleanPhone]
+          );
+        }
+        
+        // Option 3: Check by name + pincode if still no match
+        if (duplicateCheck.rows.length === 0) {
+          const cleanName = name.toLowerCase().trim().replace(/[^a-z0-9\s]/g, '');
+          
+          if (pincode) {
+            duplicateCheck = await client.query(
+              `SELECT id FROM clients 
+               WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1 
+               AND pincode = $2
+               LIMIT 1`,
+              [cleanName, pincode]
+            );
+          } else {
+            duplicateCheck = await client.query(
+              `SELECT id FROM clients 
+               WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1
+               LIMIT 1`,
+              [cleanName]
+            );
+          }
+        }
 
-      // =====================================================
-      // DUPLICATE CLEANUP (delete older with no coordinates)
-      // =====================================================
-      console.log("🧹 Running cleanup duplicates");
-      const groups = await pool.query(`
-        SELECT LOWER(name) AS key, array_agg(id) AS ids
-        FROM clients
-        GROUP BY LOWER(name)
-        HAVING COUNT(*) > 1
-      `);
+        if (duplicateCheck.rows.length > 0) {
+          // DUPLICATE FOUND - Update
+          const existingId = duplicateCheck.rows[0].id;
+          
+          await client.query(
+            `UPDATE clients 
+             SET 
+               email = COALESCE($1, email),
+               phone = COALESCE($2, phone),
+               address = COALESCE($3, address),
+               latitude = COALESCE($4, latitude),
+               longitude = COALESCE($5, longitude),
+               pincode = COALESCE($6, pincode),
+               notes = COALESCE($7, notes),
+               status = $8,
+               updated_at = NOW()
+             WHERE id = $9`,
+            [
+              email,
+              phone,
+              address,
+              latitude,
+              longitude,
+              pincode,
+              note,
+              status,
+              existingId
+            ]
+          );
 
-      for (const g of groups.rows) {
-        const ids = g.ids;
-        const clients = (
-          await pool.query(
-            `SELECT * FROM clients WHERE id = ANY($1) ORDER BY created_at DESC`,
-            [ids]
-          )
-        ).rows;
+          updated++;
+          console.log(`🔄 Updated: ${name} (ID: ${existingId})`);
+        } else {
+          // NO DUPLICATE - Insert new
+          await client.query(
+            `INSERT INTO clients
+             (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [
+              name,
+              email,
+              phone,
+              address,
+              latitude,
+              longitude,
+              status,
+              note,
+              req.user.id,
+              source,
+              pincode
+            ]
+          );
 
-        const keeper = clients[0];
-        const toDelete = clients.slice(1).filter((c) => !c.latitude || !c.longitude);
-
-        for (const del of toDelete) {
-          await pool.query(`DELETE FROM clients WHERE id = $1`, [del.id]);
-          console.log(`🗑️ Deleted duplicate without coords: ${del.name}`);
+          imported++;
+          console.log(`✅ Imported: ${name}`);
         }
       }
 
-      console.log("✅ Upload + insertion completed");
-      res.json({ status: "OK", imported: imported.length });
+      await client.query("COMMIT");
+
+      const summary = {
+        total: rows.length,
+        imported,
+        updated,
+        skipped
+      };
+
+      console.log("✅ Upload completed:", summary);
+
+      res.json({
+        status: "OK",
+        summary
+      });
 
     } catch (error) {
-      console.error("❌ Upload Excel Error:", error);
-      res.status(500).json({ error: "UploadFailed", message: error.message });
+      await client.query("ROLLBACK");
+      console.error("❌ Upload error:", error);
+      res.status(500).json({ 
+        error: "UploadFailed", 
+        message: error.message 
+      });
+    } finally {
+      client.release();
     }
   }
 );
-
-
 
 // LOGIN
 app.post("/auth/login", async (req, res) => {
@@ -359,6 +453,7 @@ app.post("/auth/logout", authenticateToken, async (req, res) => {
 
 
 // REGISTER — used by mobile app
+// REGISTER – used by mobile app
 app.post("/auth/signup", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -395,15 +490,21 @@ app.post("/auth/signup", async (req, res) => {
 
     // Issue JWT immediately
     const token = jwt.sign(
-  {
-    id: user.id,
-    email: user.email,
-    isAdmin: user.is_admin   // <— THIS MUST BE INCLUDED
-  },
-  JWT_SECRET,
-  { expiresIn: "7d" }
-);
+      {
+        id: user.id,
+        email: user.email,
+        isAdmin: false
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
 
+    // ✅ FIX: Save token to user_sessions table (same as login)
+    await pool.query(
+      `INSERT INTO user_sessions (user_id, token, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+      [user.id, token]
+    );
 
     res.status(201).json({
       message: "SignupSuccess",
@@ -415,7 +516,6 @@ app.post("/auth/signup", async (req, res) => {
     res.status(500).json({ error: "SignupFailed" });
   }
 });
-
 
 
 // FORGOT PASSWORD
