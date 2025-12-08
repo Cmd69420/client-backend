@@ -1788,8 +1788,6 @@ app.get("/admin/analytics", authenticateToken, async (req, res) => {
   }
 });
 
-// Add this near the end of server.js, before app.listen()
-
 // ============================================
 // ADMIN ROUTES - Get ALL data (no filtering)
 // ============================================
@@ -1935,6 +1933,40 @@ app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "ClockInFetchFailed" });
   }
 });
+
+app.get("/admin/clock-status", authenticateToken, requireAdmin, async (req, res) => {
+  const result = await pool.query(`
+    SELECT u.id, u.email,
+      COALESCE(p.full_name, u.email) AS full_name,
+      MAX(l.timestamp) AS last_seen,
+      CASE 
+        WHEN MAX(l.timestamp) >= NOW() - INTERVAL '15 minutes' THEN true
+        ELSE false
+      END AS clocked_in
+    FROM users u
+    LEFT JOIN profiles p ON p.user_id = u.id
+    LEFT JOIN location_logs l ON l.user_id = u.id
+    GROUP BY u.id, p.full_name
+    ORDER BY full_name;
+  `);
+
+  res.json({ users: result.rows });
+});
+
+
+app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
+  const result = await pool.query(`
+    SELECT u.id,
+      COALESCE(SUM(e.amount), 0) AS total_expense,
+      COALESCE(SUM(CASE WHEN e.status = 'pending' THEN e.amount ELSE 0 END), 0) AS pending_expense
+    FROM users u
+    LEFT JOIN expenses e ON e.user_id = u.id
+    GROUP BY u.id;
+  `);
+
+  res.json({ summary: result.rows });
+});
+
 
 
 // ============================================
