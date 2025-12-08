@@ -1937,6 +1937,226 @@ app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
 });
 
 
+// ============================================
+// TRIP EXPENSES ROUTES
+// ============================================
+
+app.post("/expenses", authenticateToken, async (req, res) => {
+  try {
+    const {
+      start_location,
+      end_location,
+      travel_date,
+      distance_km,
+      transport_mode,
+      amount_spent,
+      currency = "₹",
+      notes,
+      receipt_urls,
+      client_id
+    } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO trip_expenses
+      (user_id, start_location, end_location, travel_date, distance_km,
+       transport_mode, amount_spent, currency, notes, receipt_urls, client_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *`,
+      [
+        req.user.id,
+        start_location,
+        end_location,
+        travel_date,
+        distance_km,
+        transport_mode,
+        amount_spent,
+        currency,
+        notes,
+        receipt_urls || [],
+        client_id || null
+      ]
+    );
+
+    res.status(201).json({
+      message: "Expense created successfully",
+      expense: result.rows[0],
+    });
+  } catch (err) {
+    console.error("CREATE EXPENSE ERROR:", err);
+    res.status(500).json({ error: "CreateExpenseFailed" });
+  }
+});
+
+// Get logged-in user's expenses
+app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
+  try {
+    const { startDate, endDate, transportMode, clientId } = req.query;
+
+    let query = `SELECT * FROM trip_expenses WHERE user_id = $1`;
+    const params = [req.user.id];
+    let count = 1;
+
+    if (startDate) {
+      count++;
+      query += ` AND travel_date >= $${count}`;
+      params.push(startDate);
+    }
+    if (endDate) {
+      count++;
+      query += ` AND travel_date <= $${count}`;
+      params.push(endDate);
+    }
+    if (transportMode) {
+      count++;
+      query += ` AND transport_mode = $${count}`;
+      params.push(transportMode);
+    }
+    if (clientId) {
+      count++;
+      query += ` AND client_id = $${count}`;
+      params.push(clientId);
+    }
+
+    query += ` ORDER BY travel_date DESC`;
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      expenses: result.rows,
+      total: result.rows.length,
+      totalAmount: result.rows.reduce((sum, e) => sum + Number(e.amount_spent), 0),
+    });
+  } catch (err) {
+    console.error("GET MY EXPENSES ERROR:", err);
+    res.status(500).json({ error: "GetExpensesFailed" });
+  }
+});
+
+// Get expense by ID
+app.get("/expenses/:id", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM trip_expenses WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "ExpenseNotFound" });
+    }
+
+    res.json({ expense: result.rows[0] });
+  } catch (err) {
+    console.error("GET EXPENSE ERROR:", err);
+    res.status(500).json({ error: "GetExpenseFailed" });
+  }
+});
+
+// Update expense
+app.put("/expenses/:id", authenticateToken, async (req, res) => {
+  try {
+    const {
+      start_location,
+      end_location,
+      travel_date,
+      distance_km,
+      transport_mode,
+      amount_spent,
+      currency = "₹",
+      notes,
+      receipt_urls,
+      client_id
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE trip_expenses
+       SET start_location = $1,
+           end_location = $2,
+           travel_date = $3,
+           distance_km = $4,
+           transport_mode = $5,
+           amount_spent = $6,
+           currency = $7,
+           notes = $8,
+           receipt_urls = $9,
+           client_id = $10,
+           updated_at = NOW()
+       WHERE id = $11 AND user_id = $12
+       RETURNING *`,
+      [
+        start_location,
+        end_location,
+        travel_date,
+        distance_km,
+        transport_mode,
+        amount_spent,
+        currency,
+        notes,
+        receipt_urls || [],
+        client_id || null,
+        req.params.id,
+        req.user.id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "ExpenseNotFound" });
+    }
+
+    res.json({
+      message: "Expense updated successfully",
+      expense: result.rows[0],
+    });
+  } catch (err) {
+    console.error("UPDATE EXPENSE ERROR:", err);
+    res.status(500).json({ error: "UpdateExpenseFailed" });
+  }
+});
+
+// Delete expense
+app.delete("/expenses/:id", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM trip_expenses WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "ExpenseNotFound" });
+    }
+
+    res.status(204).send();
+  } catch (err) {
+    console.error("DELETE EXPENSE ERROR:", err);
+    res.status(500).json({ error: "DeleteExpenseFailed" });
+  }
+});
+
+// Upload receipt as base64 → returns URL
+app.post("/expenses/receipts", authenticateToken, async (req, res) => {
+  try {
+    const { imageData, fileName } = req.body;
+
+    if (!imageData) {
+      return res.status(400).json({ error: "ImageRequired" });
+    }
+
+    // In production, upload to S3 / Cloudinary / Firebase
+    const buffer = Buffer.from(imageData, "base64");
+    const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
+    const url = `https://storage.yourdomain.com/receipts/${randomName}`;
+
+    // TODO: Implement actual upload here
+    console.log("Receipt upload simulated:", randomName);
+
+    res.json({ url, fileName: randomName });
+  } catch (err) {
+    console.error("UPLOAD RECEIPT ERROR:", err);
+    res.status(500).json({ error: "UploadReceiptFailed" });
+  }
+});
+
+
+
 
 // Start server
 app.listen(PORT, () => {
