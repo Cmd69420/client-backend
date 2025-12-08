@@ -1941,6 +1941,7 @@ app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
 // TRIP EXPENSES ROUTES
 // ============================================
 
+// Create expense
 app.post("/expenses", authenticateToken, async (req, res) => {
   try {
     const {
@@ -1984,6 +1985,25 @@ app.post("/expenses", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("CREATE EXPENSE ERROR:", err);
     res.status(500).json({ error: "CreateExpenseFailed" });
+  }
+});
+
+// ✅ SPECIFIC ROUTES FIRST - Get total expenses (NEW)
+app.get("/expenses/my-total", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(amount_spent), 0) as total_amount
+       FROM trip_expenses
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    res.json({
+      totalAmount: parseFloat(result.rows[0].total_amount)
+    });
+  } catch (err) {
+    console.error("GET TOTAL EXPENSE ERROR:", err);
+    res.status(500).json({ error: "GetTotalExpenseFailed" });
   }
 });
 
@@ -2032,7 +2052,31 @@ app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
   }
 });
 
-// Get expense by ID
+// Upload receipt as base64 → returns URL
+app.post("/expenses/receipts", authenticateToken, async (req, res) => {
+  try {
+    const { imageData, fileName } = req.body;
+
+    if (!imageData) {
+      return res.status(400).json({ error: "ImageRequired" });
+    }
+
+    // In production, upload to S3 / Cloudinary / Firebase
+    const buffer = Buffer.from(imageData, "base64");
+    const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
+    const url = `https://storage.yourdomain.com/receipts/${randomName}`;
+
+    // TODO: Implement actual upload here
+    console.log("Receipt upload simulated:", randomName);
+
+    res.json({ url, fileName: randomName });
+  } catch (err) {
+    console.error("UPLOAD RECEIPT ERROR:", err);
+    res.status(500).json({ error: "UploadReceiptFailed" });
+  }
+});
+
+// ⚠️ DYNAMIC ROUTES LAST - Get expense by ID
 app.get("/expenses/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2130,33 +2174,6 @@ app.delete("/expenses/:id", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "DeleteExpenseFailed" });
   }
 });
-
-// Upload receipt as base64 → returns URL
-app.post("/expenses/receipts", authenticateToken, async (req, res) => {
-  try {
-    const { imageData, fileName } = req.body;
-
-    if (!imageData) {
-      return res.status(400).json({ error: "ImageRequired" });
-    }
-
-    // In production, upload to S3 / Cloudinary / Firebase
-    const buffer = Buffer.from(imageData, "base64");
-    const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
-    const url = `https://storage.yourdomain.com/receipts/${randomName}`;
-
-    // TODO: Implement actual upload here
-    console.log("Receipt upload simulated:", randomName);
-
-    res.json({ url, fileName: randomName });
-  } catch (err) {
-    console.error("UPLOAD RECEIPT ERROR:", err);
-    res.status(500).json({ error: "UploadReceiptFailed" });
-  }
-});
-
-
-
 
 // Start server
 app.listen(PORT, () => {
