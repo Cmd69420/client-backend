@@ -1936,24 +1936,30 @@ app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/admin/clock-status", authenticateToken, requireAdmin, async (req, res) => {
-  const result = await pool.query(`
-    SELECT u.id, u.email,
-      COALESCE(p.full_name, u.email) AS full_name,
-      MAX(l.timestamp) AS last_seen,
-      CASE 
-        WHEN MAX(l.timestamp) >= NOW() - INTERVAL '15 minutes' THEN true
-        ELSE false
-      END AS clocked_in
-    FROM users u
-    LEFT JOIN profiles p ON p.user_id = u.id
-    LEFT JOIN location_logs l ON l.user_id = u.id
-    GROUP BY u.id, p.full_name
-    ORDER BY full_name;
-  `);
+app.get("/admin/clock-status/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
 
-  res.json({ users: result.rows });
+  const result = await pool.query(`
+    SELECT l.timestamp
+    FROM location_logs l
+    WHERE l.user_id = $1
+    ORDER BY l.timestamp DESC
+    LIMIT 1;
+  `, [userId]);
+
+  if (result.rows.length === 0) {
+    return res.json({ clocked_in: false, last_seen: null });
+  }
+
+  const lastSeen = new Date(result.rows[0].timestamp);
+  const isActive = lastSeen >= new Date(Date.now() - 2 * 60 * 1000); // 2 minutes
+
+  res.json({
+    clocked_in: isActive,
+    last_seen: lastSeen.toISOString()
+  });
 });
+
 
 
 app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
