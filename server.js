@@ -2156,6 +2156,23 @@ app.post("/expenses/receipts", authenticateToken, async (req, res) => {
 });
 
 
+app.get("/expenses/my-total", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT COALESCE(SUM(amount_spent), 0) AS total_amount FROM trip_expenses WHERE user_id = $1",
+      [req.user.id]
+    );
+
+    res.json({
+      totalAmount: Number(result.rows[0].total_amount)
+    });
+  } catch (err) {
+    console.error("GET TOTAL EXPENSE ERROR:", err);
+    res.status(500).json({ error: "GetTotalExpenseFailed" });
+  }
+});
+
+
 
 
 // Start server
