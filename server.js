@@ -9,7 +9,9 @@ import { pool } from "./db.js";
 
 const app = express();
 app.use(cors({
-  origin: "*",                                      // or your specific dashboard URL
+  origin: [
+    "http://localhost:3000",         // Local React dashboard // If you deploy later
+  ],                                     // or your specific dashboard URL
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
@@ -1788,8 +1790,6 @@ app.get("/admin/analytics", authenticateToken, async (req, res) => {
   }
 });
 
-// Add this near the end of server.js, before app.listen()
-
 // ============================================
 // ADMIN ROUTES - Get ALL data (no filtering)
 // ============================================
@@ -1936,11 +1936,52 @@ app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/admin/clock-status/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+
+  const result = await pool.query(`
+    SELECT l.timestamp
+    FROM location_logs l
+    WHERE l.user_id = $1
+    ORDER BY l.timestamp DESC
+    LIMIT 1;
+  `, [userId]);
+
+  if (result.rows.length === 0) {
+    return res.json({ clocked_in: false, last_seen: null });
+  }
+
+  const lastSeen = new Date(result.rows[0].timestamp);
+  const isActive = lastSeen >= new Date(Date.now() - 2 * 60 * 1000); // 2 minutes
+
+  res.json({
+    clocked_in: isActive,
+    last_seen: lastSeen.toISOString()
+  });
+});
+
+
+
+app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
+  const result = await pool.query(`
+    SELECT u.id,
+      COALESCE(SUM(e.amount_spent), 0) AS total_expense
+    FROM users u
+    LEFT JOIN trip_expenses e ON e.user_id = u.id
+    GROUP BY u.id;
+  `);
+
+  res.json({ summary: result.rows });
+});
+
+
+
 
 // ============================================
 // TRIP EXPENSES ROUTES
 // ============================================
 
+// Create expense
 app.post("/expenses", authenticateToken, async (req, res) => {
   try {
     const {
@@ -1984,6 +2025,25 @@ app.post("/expenses", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("CREATE EXPENSE ERROR:", err);
     res.status(500).json({ error: "CreateExpenseFailed" });
+  }
+});
+
+// ✅ SPECIFIC ROUTES FIRST - Get total expenses (NEW)
+app.get("/expenses/my-total", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(amount_spent), 0) as total_amount
+       FROM trip_expenses
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    res.json({
+      totalAmount: parseFloat(result.rows[0].total_amount)
+    });
+  } catch (err) {
+    console.error("GET TOTAL EXPENSE ERROR:", err);
+    res.status(500).json({ error: "GetTotalExpenseFailed" });
   }
 });
 
@@ -2032,7 +2092,31 @@ app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
   }
 });
 
-// Get expense by ID
+// Upload receipt as base64 → returns URL
+app.post("/expenses/receipts", authenticateToken, async (req, res) => {
+  try {
+    const { imageData, fileName } = req.body;
+
+    if (!imageData) {
+      return res.status(400).json({ error: "ImageRequired" });
+    }
+
+    // In production, upload to S3 / Cloudinary / Firebase
+    const buffer = Buffer.from(imageData, "base64");
+    const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
+    const url = `https://storage.yourdomain.com/receipts/${randomName}`;
+
+    // TODO: Implement actual upload here
+    console.log("Receipt upload simulated:", randomName);
+
+    res.json({ url, fileName: randomName });
+  } catch (err) {
+    console.error("UPLOAD RECEIPT ERROR:", err);
+    res.status(500).json({ error: "UploadReceiptFailed" });
+  }
+});
+
+// ⚠️ DYNAMIC ROUTES LAST - Get expense by ID
 app.get("/expenses/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2130,50 +2214,6 @@ app.delete("/expenses/:id", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "DeleteExpenseFailed" });
   }
 });
-
-// Upload receipt as base64 → returns URL
-app.post("/expenses/receipts", authenticateToken, async (req, res) => {
-  try {
-    const { imageData, fileName } = req.body;
-
-    if (!imageData) {
-      return res.status(400).json({ error: "ImageRequired" });
-    }
-
-    // In production, upload to S3 / Cloudinary / Firebase
-    const buffer = Buffer.from(imageData, "base64");
-    const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
-    const url = `https://storage.yourdomain.com/receipts/${randomName}`;
-
-    // TODO: Implement actual upload here
-    console.log("Receipt upload simulated:", randomName);
-
-    res.json({ url, fileName: randomName });
-  } catch (err) {
-    console.error("UPLOAD RECEIPT ERROR:", err);
-    res.status(500).json({ error: "UploadReceiptFailed" });
-  }
-});
-
-
-app.get("/expenses/my-total", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT COALESCE(SUM(amount_spent), 0) AS total_amount FROM trip_expenses WHERE user_id = $1",
-      [req.user.id]
-    );
-
-    res.json({
-      totalAmount: Number(result.rows[0].total_amount)
-    });
-  } catch (err) {
-    console.error("GET TOTAL EXPENSE ERROR:", err);
-    res.status(500).json({ error: "GetTotalExpenseFailed" });
-  }
-});
-
-
-
 
 // Start server
 app.listen(PORT, () => {
