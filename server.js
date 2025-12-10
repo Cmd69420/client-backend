@@ -6,45 +6,41 @@ import crypto from "crypto";
 import xlsx from "xlsx";
 import multer from "multer";
 import { pool } from "./db.js";
+import { startBackgroundGeocode } from "./utils/geocodeBatch.js";
 
 const app = express();
 app.use(cors({
   origin: [
     "http://localhost:3000", 
-    "https://clientdashboard.onrender.com"// Local React dashboard // If you deploy later
-  ],                                     // or your specific dashboard URL
+    "https://geo-track-em3s.onrender.com"
+  ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// Handle preflight requests
 app.options("*", cors());
 app.use(express.json());
 
-
 const JWT_SECRET = process.env.JWT_SECRET || "your-super-secret-jwt-key-change-in-production";
 const PORT = process.env.PORT || 5000;
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const MIDDLEWARE_TOKEN = process.env.MIDDLEWARE_TOKEN || "tally-middleware-secret-key-12345";
 
 // Test DB connection
 pool.query("SELECT NOW()", (err, res) => {
   if (err) {
-    console.error("âŒ Database connection failed:", err);
+    console.error("❌ Database connection failed:", err);
   } else {
-    console.log("âœ… Database connected successfully");
+    console.log("✅ Database connected successfully");
   }
 });
 
-
 const upload = multer({ storage: multer.memoryStorage() });
+
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
 
-// Convert GPS coordinates to pincode using reverse geocoding
-// Add at top with other constants
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY; // Get from Google Cloud Console
-
-// Replace the function
 const getPincodeFromCoordinates = async (latitude, longitude) => {
   try {
     const response = await fetch(
@@ -60,19 +56,18 @@ const getPincodeFromCoordinates = async (latitude, longitude) => {
       );
       
       const pincode = pincodeComponent?.long_name || null;
-      console.log(`ðŸ“ Google: (${latitude}, ${longitude}) â†’ Pincode: ${pincode}`);
+      console.log(`📍 Google: (${latitude}, ${longitude}) → Pincode: ${pincode}`);
       return pincode;
     }
     
-    console.log(`âš ï¸ Google API returned: ${data.status}`);
+    console.log(`⚠️ Google API returned: ${data.status}`);
     return null;
   } catch (error) {
-    console.error("âŒ Google Geocoding error:", error);
+    console.error("❌ Google Geocoding error:", error);
     return null;
   }
 };
 
-// Get user's current pincode from their latest location log
 async function getCoordinatesFromPincode(pincode) {
   try {
     const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${pincode}&key=${GOOGLE_MAPS_API_KEY}`;
@@ -109,39 +104,36 @@ async function getCoordinatesFromAddress(address) {
 // ============================================
 // MIDDLEWARE
 // ============================================
- app.use((req, res, next) => {
-  console.log(`ðŸ“¥ ${req.method} ${req.path}`);
+
+app.use((req, res, next) => {
+  console.log(`📥 ${req.method} ${req.path}`);
   next();
 });
-// Verify JWT Token
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
- 
 
   if (!token) {
     return res.status(401).json({ error: "AccessTokenRequired" });
   }
 
   jwt.verify(token, JWT_SECRET, async (err, decoded) => {
-  if (err) return res.status(403).json({ error: "InvalidToken" });
+    if (err) return res.status(403).json({ error: "InvalidToken" });
 
-  const result = await pool.query(
-    `SELECT * FROM user_sessions WHERE token = $1 AND expires_at > NOW()`,
-    [token]
-  );
+    const result = await pool.query(
+      `SELECT * FROM user_sessions WHERE token = $1 AND expires_at > NOW()`,
+      [token]
+    );
 
-  if (result.rows.length === 0) {
-    return res.status(401).json({ error: "SessionExpired" });
-  }
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "SessionExpired" });
+    }
 
-  req.user = decoded;
-  next();
-});
-
+    req.user = decoded;
+    next();
+  });
 };
-
-console.log("ðŸ”§ Registering routes...");
 
 const requireAdmin = (req, res, next) => {
   if (!req.user || !req.user.isAdmin) {
@@ -149,8 +141,287 @@ const requireAdmin = (req, res, next) => {
   }
   next();
 };
+
+const authenticateMiddleware = (req, res, next) => {
+  const token = req.headers["x-middleware-token"];
+
+  if (!token) {
+    return res.status(401).json({ error: "MiddlewareTokenRequired" });
+  }
+
+  if (token !== MIDDLEWARE_TOKEN) {
+    return res.status(403).json({ error: "InvalidMiddlewareToken" });
+  }
+
+  next();
+};
+
 // ============================================
-// FIXED: Proper type casting for PostgreSQL
+// AUTH ROUTES
+// ============================================
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "MissingFields" });
+    }
+
+    const result = await pool.query(
+      `SELECT u.*, p.full_name, p.department, p.work_hours_start, p.work_hours_end
+       FROM users u
+       LEFT JOIN profiles p ON u.id = p.user_id
+       WHERE u.email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "InvalidCredentials" });
+    }
+
+    const user = result.rows[0];
+
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: "InvalidCredentials" });
+    }
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        isAdmin: user.is_admin
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    await pool.query(
+      `INSERT INTO user_sessions (user_id, token, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+      [user.id, token]
+    );
+
+    res.json({
+      message: "LoginSuccess",
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        department: user.department,
+        workHoursStart: user.work_hours_start,
+        workHoursEnd: user.work_hours_end,
+      },
+    });
+  } catch (err) {
+    console.error("LOGIN ERROR:", err);
+    res.status(500).json({ error: "LoginFailed" });
+  }
+});
+
+app.post("/auth/logout", authenticateToken, async (req, res) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  await pool.query(`DELETE FROM user_sessions WHERE token = $1`, [token]);
+  res.json({ message: "LogoutSuccess" });
+});
+
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "MissingFields" });
+    }
+
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "EmailAlreadyExists" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const userResult = await pool.query(
+      `INSERT INTO users (email, password, is_admin)
+       VALUES ($1, $2, false)
+       RETURNING id, email`,
+      [email, hashedPassword]
+    );
+
+    const user = userResult.rows[0];
+
+    await pool.query(
+      `INSERT INTO profiles (user_id) VALUES ($1)`,
+      [user.id]
+    );
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        isAdmin: false
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    await pool.query(
+      `INSERT INTO user_sessions (user_id, token, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+      [user.id, token]
+    );
+
+    res.status(201).json({
+      message: "SignupSuccess",
+      token,
+      user,
+    });
+  } catch (err) {
+    console.error("SIGNUP ERROR:", err);
+    res.status(500).json({ error: "SignupFailed" });
+  }
+});
+
+app.post("/auth/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: "EmailRequired" });
+    }
+
+    const result = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+
+    if (result.rows.length === 0) {
+      return res.json({ message: "PasswordResetEmailSent" });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const resetTokenExpiry = new Date(Date.now() + 3600000);
+
+    await pool.query(
+      "UPDATE users SET reset_token = $1, reset_token_expiry = $2 WHERE email = $3",
+      [resetToken, resetTokenExpiry, email]
+    );
+
+    console.log("🔑 Password Reset Token:", resetToken);
+    console.log("📧 For Email:", email);
+
+    res.json({
+      message: "PasswordResetEmailSent",
+      resetToken: resetToken,
+    });
+  } catch (err) {
+    console.error("FORGOT PASSWORD ERROR:", err);
+    res.status(500).json({ error: "ForgotPasswordFailed" });
+  }
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: "MissingFields" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "PasswordTooShort" });
+    }
+
+    const result = await pool.query(
+      "SELECT id FROM users WHERE reset_token = $1 AND reset_token_expiry > NOW()",
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "InvalidOrExpiredToken" });
+    }
+
+    const userId = result.rows[0].id;
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await pool.query(
+      "UPDATE users SET password = $1, reset_token = NULL, reset_token_expiry = NULL WHERE id = $2",
+      [hashedPassword, userId]
+    );
+
+    res.json({ message: "PasswordResetSuccess" });
+  } catch (err) {
+    console.error("RESET PASSWORD ERROR:", err);
+    res.status(500).json({ error: "ResetPasswordFailed" });
+  }
+});
+
+app.get("/auth/profile", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.email, p.full_name, p.department, p.work_hours_start, p.work_hours_end, p.created_at
+       FROM users u
+       LEFT JOIN profiles p ON u.id = p.user_id
+       WHERE u.id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "UserNotFound" });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    console.error("GET PROFILE ERROR:", err);
+    res.status(500).json({ error: "GetProfileFailed" });
+  }
+});
+
+app.put("/auth/profile", authenticateToken, async (req, res) => {
+  try {
+    const { fullName, department, workHoursStart, workHoursEnd } = req.body;
+
+    const result = await pool.query(
+      `UPDATE profiles 
+       SET full_name = $1, department = $2, work_hours_start = $3, work_hours_end = $4
+       WHERE user_id = $5
+       RETURNING id, user_id, email, full_name, department, work_hours_start, work_hours_end`,
+      [fullName, department, workHoursStart, workHoursEnd, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "ProfileNotFound" });
+    }
+
+    res.json({
+      message: "ProfileUpdated",
+      profile: result.rows[0],
+    });
+  } catch (err) {
+    console.error("UPDATE PROFILE ERROR:", err);
+    res.status(500).json({ error: "UpdateProfileFailed" });
+  }
+});
+
+app.post("/auth/clear-pincode", authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users SET pincode = NULL WHERE id = $1`,
+      [req.user.id]
+    );
+    console.log(`🛑 Tracking stopped → cleared pincode for ${req.user.id}`);
+    res.json({ message: "PincodeCleared" });
+  } catch (err) {
+    res.status(500).json({ error: "ClearPincodeFailed" });
+  }
+});
+
+// ============================================
+// CLIENTS ROUTES
 // ============================================
 
 app.post(
@@ -219,7 +490,6 @@ app.post(
           continue;
         }
 
-        // Geocode if needed
         if (pincode && (!latitude || !longitude)) {
           try {
             const geo = await getCoordinatesFromPincode(pincode);
@@ -245,11 +515,6 @@ app.post(
           }
         }
 
-        // ============================================
-        // SIMPLIFIED DUPLICATE CHECK WITH EXPLICIT TYPES
-        // ============================================
-        
-        // Option 1: Check by email first (most reliable)
         let duplicateCheck = { rows: [] };
         
         if (email) {
@@ -259,9 +524,8 @@ app.post(
           );
         }
         
-        // Option 2: Check by phone if no email match
         if (duplicateCheck.rows.length === 0 && phone) {
-          const cleanPhone = phone.replace(/\D/g, ''); // Remove non-digits
+          const cleanPhone = phone.replace(/\D/g, '');
           duplicateCheck = await client.query(
             `SELECT id FROM clients 
              WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 
@@ -270,7 +534,6 @@ app.post(
           );
         }
         
-        // Option 3: Check by name + pincode if still no match
         if (duplicateCheck.rows.length === 0) {
           const cleanName = name.toLowerCase().trim().replace(/[^a-z0-9\s]/g, '');
           
@@ -293,7 +556,6 @@ app.post(
         }
 
         if (duplicateCheck.rows.length > 0) {
-          // DUPLICATE FOUND - Update
           const existingId = duplicateCheck.rows[0].id;
           
           await client.query(
@@ -309,40 +571,17 @@ app.post(
                status = $8,
                updated_at = NOW()
              WHERE id = $9`,
-            [
-              email,
-              phone,
-              address,
-              latitude,
-              longitude,
-              pincode,
-              note,
-              status,
-              existingId
-            ]
+            [email, phone, address, latitude, longitude, pincode, note, status, existingId]
           );
 
           updated++;
-          console.log(`🔄 Updated: ${name} (ID: ${existingId})`);
+          console.log(`📄 Updated: ${name} (ID: ${existingId})`);
         } else {
-          // NO DUPLICATE - Insert new
           await client.query(
             `INSERT INTO clients
              (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [
-              name,
-              email,
-              phone,
-              address,
-              latitude,
-              longitude,
-              status,
-              note,
-              req.user.id,
-              source,
-              pincode
-            ]
+            [name, email, phone, address, latitude, longitude, status, note, req.user.id, source, pincode]
           );
 
           imported++;
@@ -379,293 +618,6 @@ app.post(
   }
 );
 
-// LOGIN
-app.post("/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "MissingFields" });
-    }
-
-    const result = await pool.query(
-      `SELECT u.*, p.full_name, p.department, p.work_hours_start, p.work_hours_end
-       FROM users u
-       LEFT JOIN profiles p ON u.id = p.user_id
-       WHERE u.email = $1`,
-      [email]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: "InvalidCredentials" });
-    }
-
-    const user = result.rows[0];
-
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: "InvalidCredentials" });
-    }
-
-    const token = jwt.sign(
-  {
-    id: user.id,
-    email: user.email,
-    isAdmin: user.is_admin   // <— REQUIRED
-  },
-  JWT_SECRET,
-  { expiresIn: "7d" }
-);
-
-  // Save token to server sessions table
-await pool.query(
-  `INSERT INTO user_sessions (user_id, token, expires_at)
-   VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-  [user.id, token]
-);
-
-
-    res.json({
-      message: "LoginSuccess",
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.full_name,
-        department: user.department,
-        workHoursStart: user.work_hours_start,
-        workHoursEnd: user.work_hours_end,
-      },
-    });
-  } catch (err) {
-    console.error("LOGIN ERROR:", err);
-    res.status(500).json({ error: "LoginFailed" });
-  }
-});
-
-
-app.post("/auth/logout", authenticateToken, async (req, res) => {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-
-  await pool.query(`DELETE FROM user_sessions WHERE token = $1`, [token]);
-  res.json({ message: "LogoutSuccess" });
-});
-
-
-
-
-// REGISTER — used by mobile app
-// REGISTER – used by mobile app
-app.post("/auth/signup", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "MissingFields" });
-    }
-
-    const existing = await pool.query(
-      "SELECT id FROM users WHERE email = $1",
-      [email]
-    );
-
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: "EmailAlreadyExists" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const userResult = await pool.query(
-      `INSERT INTO users (email, password, is_admin)
-       VALUES ($1, $2, false)
-       RETURNING id, email`,
-      [email, hashedPassword]
-    );
-
-    const user = userResult.rows[0];
-
-    // Optional profile row
-    await pool.query(
-      `INSERT INTO profiles (user_id) VALUES ($1)`,
-      [user.id]
-    );
-
-    // Issue JWT immediately
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        isAdmin: false
-      },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    // ✅ FIX: Save token to user_sessions table (same as login)
-    await pool.query(
-      `INSERT INTO user_sessions (user_id, token, expires_at)
-       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-      [user.id, token]
-    );
-
-    res.status(201).json({
-      message: "SignupSuccess",
-      token,
-      user,
-    });
-  } catch (err) {
-    console.error("SIGNUP ERROR:", err);
-    res.status(500).json({ error: "SignupFailed" });
-  }
-});
-
-
-// FORGOT PASSWORD
-app.post("/auth/forgot-password", async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: "EmailRequired" });
-    }
-
-    const result = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-
-    if (result.rows.length === 0) {
-      return res.json({ message: "PasswordResetEmailSent" });
-    }
-
-    const resetToken = crypto.randomBytes(32).toString("hex");
-    const resetTokenExpiry = new Date(Date.now() + 3600000); // 1 hour
-
-    await pool.query(
-      "UPDATE users SET reset_token = $1, reset_token_expiry = $2 WHERE email = $3",
-      [resetToken, resetTokenExpiry, email]
-    );
-
-    console.log("ðŸ”‘ Password Reset Token:", resetToken);
-    console.log("ðŸ“§ For Email:", email);
-
-    res.json({
-      message: "PasswordResetEmailSent",
-      resetToken: resetToken, // Remove in production
-    });
-  } catch (err) {
-    console.error("FORGOT PASSWORD ERROR:", err);
-    res.status(500).json({ error: "ForgotPasswordFailed" });
-  }
-});
-
-// RESET PASSWORD
-app.post("/auth/reset-password", async (req, res) => {
-  try {
-    const { token, newPassword } = req.body;
-
-    if (!token || !newPassword) {
-      return res.status(400).json({ error: "MissingFields" });
-    }
-
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: "PasswordTooShort" });
-    }
-
-    const result = await pool.query(
-      "SELECT id FROM users WHERE reset_token = $1 AND reset_token_expiry > NOW()",
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: "InvalidOrExpiredToken" });
-    }
-
-    const userId = result.rows[0].id;
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    await pool.query(
-      "UPDATE users SET password = $1, reset_token = NULL, reset_token_expiry = NULL WHERE id = $2",
-      [hashedPassword, userId]
-    );
-
-    res.json({ message: "PasswordResetSuccess" });
-  } catch (err) {
-    console.error("RESET PASSWORD ERROR:", err);
-    res.status(500).json({ error: "ResetPasswordFailed" });
-  }
-});
-
-// GET PROFILE
-app.get("/auth/profile", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT u.id, u.email, p.full_name, p.department, p.work_hours_start, p.work_hours_end, p.created_at
-       FROM users u
-       LEFT JOIN profiles p ON u.id = p.user_id
-       WHERE u.id = $1`,
-      [req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "UserNotFound" });
-    }
-
-    res.json({ user: result.rows[0] });
-  } catch (err) {
-    console.error("GET PROFILE ERROR:", err);
-    res.status(500).json({ error: "GetProfileFailed" });
-  }
-});
-
-// UPDATE PROFILE
-app.put("/auth/profile", authenticateToken, async (req, res) => {
-  try {
-    const { fullName, department, workHoursStart, workHoursEnd } = req.body;
-
-    const result = await pool.query(
-      `UPDATE profiles 
-       SET full_name = $1, department = $2, work_hours_start = $3, work_hours_end = $4
-       WHERE user_id = $5
-       RETURNING id, user_id, email, full_name, department, work_hours_start, work_hours_end`,
-      [fullName, department, workHoursStart, workHoursEnd, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "ProfileNotFound" });
-    }
-
-    res.json({
-      message: "ProfileUpdated",
-      profile: result.rows[0],
-    });
-  } catch (err) {
-    console.error("UPDATE PROFILE ERROR:", err);
-    res.status(500).json({ error: "UpdateProfileFailed" });
-  }
-});
-
-// ============================================
-// CLIENTS ROUTES (WITH PINCODE FILTERING)
-// ============================================
-
-
-app.post("/auth/clear-pincode", authenticateToken, async (req, res) => {
-  try {
-    await pool.query(
-      `UPDATE users SET pincode = NULL WHERE id = $1`,
-      [req.user.id]
-    );
-    console.log(`🛑 Tracking stopped → cleared pincode for ${req.user.id}`);
-    res.json({ message: "PincodeCleared" });
-  } catch (err) {
-    res.status(500).json({ error: "ClearPincodeFailed" });
-  }
-});
-
-
-
-
-
-// CREATE CLIENT (with pincode auto-calculation)
 app.post("/clients", authenticateToken, async (req, res) => {
   try {
     const { name, email, phone, address, latitude, longitude, status, notes } = req.body;
@@ -674,7 +626,6 @@ app.post("/clients", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "ClientNameRequired" });
     }
 
-    // Auto-calculate pincode if lat/lng provided
     let pincode = null;
     if (latitude && longitude) {
       pincode = await getPincodeFromCoordinates(latitude, longitude);
@@ -687,7 +638,7 @@ app.post("/clients", authenticateToken, async (req, res) => {
       [name, email || null, phone || null, address || null, latitude || null, longitude || null, status || "active", notes || null, pincode, req.user.id]
     );
 
-    console.log(`âœ… Client created: ${name} (Pincode: ${pincode || 'N/A'})`);
+    console.log(`✅ Client created: ${name} (Pincode: ${pincode || 'N/A'})`);
 
     res.status(201).json({
       message: "ClientCreated",
@@ -699,15 +650,13 @@ app.post("/clients", authenticateToken, async (req, res) => {
   }
 });
 
-// GET ALL CLIENTS (FILTERED BY USER'S CURRENT PINCODE)
 app.get("/clients", authenticateToken, async (req, res) => {
   try {
     const { status, search, page = 1, limit = 100 } = req.query;
     const offset = (page - 1) * limit;
 
-    console.log(`ðŸ” Fetching clients for user: ${req.user.id}`);
+    console.log(`👤 Fetching clients for user: ${req.user.id}`);
 
-    // Get user's current pincode from their latest location log
     const userPincode = (await pool.query("SELECT pincode FROM users WHERE id = $1", [req.user.id])).rows[0]?.pincode;
     if (!userPincode) {
       return res.status(400).json({ 
@@ -716,20 +665,17 @@ app.get("/clients", authenticateToken, async (req, res) => {
       });
     }
 
-    console.log(`ðŸ“ Filtering clients by pincode: ${userPincode}`);
+    console.log(`📍 Filtering clients by pincode: ${userPincode}`);
 
-    // Build query - FILTER BY PINCODE
-   let query = `
-  SELECT *
-  FROM clients
-  WHERE pincode = $1
-  AND (created_by IS NULL OR created_by = $2)
-`;
-const params = [userPincode, req.user.id];
-let paramCount = 2;
+    let query = `
+      SELECT *
+      FROM clients
+      WHERE pincode = $1
+      AND (created_by IS NULL OR created_by = $2)
+    `;
+    const params = [userPincode, req.user.id];
+    let paramCount = 2;
 
-
-    // Additional filters
     if (status) {
       paramCount++;
       query += ` AND status = $${paramCount}`;
@@ -747,7 +693,6 @@ let paramCount = 2;
 
     const result = await pool.query(query, params);
 
-    // Get total count
     let countQuery = "SELECT COUNT(*) FROM clients WHERE pincode = $1";
     const countParams = [userPincode];
     let countParamIndex = 1;
@@ -761,7 +706,7 @@ let paramCount = 2;
     const countResult = await pool.query(countQuery, countParams);
     const total = parseInt(countResult.rows[0].count);
 
-    console.log(`âœ… Found ${result.rows.length} clients in pincode ${userPincode}`);
+    console.log(`✅ Found ${result.rows.length} clients in pincode ${userPincode}`);
 
     res.json({
       clients: result.rows,
@@ -780,7 +725,6 @@ let paramCount = 2;
   }
 });
 
-// GET SINGLE CLIENT
 app.get("/clients/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -799,12 +743,10 @@ app.get("/clients/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// UPDATE CLIENT
 app.put("/clients/:id", authenticateToken, async (req, res) => {
   try {
     const { name, email, phone, address, latitude, longitude, status, notes } = req.body;
 
-    // Auto-calculate pincode if lat/lng changed
     let pincode = null;
     if (latitude && longitude) {
       pincode = await getPincodeFromCoordinates(latitude, longitude);
@@ -832,7 +774,6 @@ app.put("/clients/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE CLIENT
 app.delete("/clients/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -855,47 +796,32 @@ app.delete("/clients/:id", authenticateToken, async (req, res) => {
 // LOCATION LOGS ROUTES
 // ============================================
 
-// CREATE LOCATION LOG (with automatic pincode detection)
 app.post("/location-logs", authenticateToken, async (req, res) => {
   try {
     const { latitude, longitude, accuracy, activity, notes, battery } = req.body;
-
 
     if (!latitude || !longitude) {
       return res.status(400).json({ error: "LocationRequired" });
     }
 
-    console.log(`ðŸ“ Logging location for user ${req.user.id}: ${latitude}, ${longitude}`);
+    console.log(`📍 Logging location for user ${req.user.id}: ${latitude}, ${longitude}`);
 
-    // Get pincode from coordinates
     const pincode = await getPincodeFromCoordinates(latitude, longitude);
 
     const result = await pool.query(
       `INSERT INTO location_logs (user_id, latitude, longitude, accuracy, activity, notes, pincode, battery)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *
-`,
-      [req.user.id, latitude, longitude, accuracy || null, activity || null, notes || null, pincode, battery || null
-]
-
+       RETURNING *`,
+      [req.user.id, latitude, longitude, accuracy || null, activity || null, notes || null, pincode, battery || null]
     );
 
-    // 🔄 update user's pincode based on latest location
     if (pincode) {
       await pool.query(
         `UPDATE users SET pincode = $1 WHERE id = $2 AND pincode IS DISTINCT FROM $1`,
         [pincode, req.user.id]
       );
-      console.log(`📍 Updated user pincode to ${pincode} for user ${req.user.id}`);
+      console.log(`📌 Updated user pincode to ${pincode} for user ${req.user.id}`);
     }
-
-
-    await pool.query(
-                 `UPDATE users
-                  SET pincode = $1
-                  WHERE id = $2 AND pincode IS NULL`,
-    [pincode, req.user.id]
-);
 
     const log = result.rows[0];
     const mappedLog = {
@@ -910,9 +836,9 @@ app.post("/location-logs", authenticateToken, async (req, res) => {
       pincode: log.pincode,
       timestamp: log.timestamp
     };
-    console.log(`🔋 Battery logged for user ${req.user.id}: ${battery}% @ ${latitude}, ${longitude}`);
 
-    console.log(`âœ… Location logged with pincode: ${pincode}`);
+    console.log(`🔋 Battery logged for user ${req.user.id}: ${battery}% @ ${latitude}, ${longitude}`);
+    console.log(`✅ Location logged with pincode: ${pincode}`);
 
     res.status(201).json({
       message: "LocationLogged",
@@ -924,7 +850,6 @@ app.post("/location-logs", authenticateToken, async (req, res) => {
   }
 });
 
-// GET LOCATION LOGS
 app.get("/location-logs", authenticateToken, async (req, res) => {
   try {
     const { startDate, endDate, page = 1, limit = 50 } = req.query;
@@ -976,133 +901,32 @@ app.get("/location-logs", authenticateToken, async (req, res) => {
   }
 });
 
-// ============================================
-// UTILITY ROUTES
-// ============================================
-
-app.get("/", (req, res) => {
-  res.json({ message: "Client Tracking API with Pincode Filtering" });
-});
-
-app.get("/dbtest", async (req, res) => {
+app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query("SELECT NOW()");
-    res.json({ db_time: result.rows[0].now });
+    const result = await pool.query(
+      `SELECT latitude, longitude, timestamp
+       FROM location_logs
+       WHERE user_id = $1
+         AND DATE(timestamp) = CURRENT_DATE
+       ORDER BY timestamp ASC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ clockIn: null });
+    }
+
+    res.json({ clockIn: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "ClockInFetchFailed" });
   }
 });
 
-
 // ============================================
-// DUPLICATE DETECTION & CLEANUP
-// ============================================
-
-// Helper function to detect and remove duplicates
-const removeDuplicateClients = async (client) => {
-  try {
-    // Strategy: Find duplicates based on:
-    // 1. Same name (case-insensitive, ignore special characters)
-    // 2. OR same email
-    // 3. OR same phone
-    // 4. OR same location (within 100 meters)
-
-    const cleanName = (name) => {
-      return name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, '') // Remove special chars like â€“ vs -
-        .replace(/\s+/g, ' ')
-        .trim();
-    };
-
-    const duplicateQuery = `
-      SELECT id, name, email, phone, latitude, longitude, pincode, created_at
-      FROM clients
-      WHERE (
-        -- Same name (cleaned)
-        LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g')) = $1
-        
-        -- OR same email
-        ${client.email ? 'OR email = $2' : ''}
-        
-        -- OR same phone
-        ${client.phone ? 'OR phone = $3' : ''}
-        
-        -- OR same location (within ~100 meters)
-        ${client.latitude && client.longitude ? `
-          OR (
-            latitude IS NOT NULL 
-            AND longitude IS NOT NULL
-            AND (6371000 * acos(
-              cos(radians($4)) * cos(radians(latitude)) * 
-              cos(radians(longitude) - radians($5)) + 
-              sin(radians($4)) * sin(radians(latitude))
-            )) <= 100
-          )
-        ` : ''}
-      )
-      ORDER BY created_at ASC
-    `;
-
-    const params = [cleanName(client.name)];
-    if (client.email) params.push(client.email);
-    if (client.phone) params.push(client.phone);
-    if (client.latitude && client.longitude) {
-      params.push(client.latitude, client.longitude);
-    }
-
-    const result = await pool.query(duplicateQuery, params);
-
-    if (result.rows.length > 1) {
-      console.log(`ðŸ” Found ${result.rows.length} duplicates for: ${client.name}`);
-      
-      // Keep the newest one (most recent data), delete older ones
-      const newest = result.rows[result.rows.length - 1];
-      const oldOnes = result.rows.slice(0, -1);
-      
-      for (const old of oldOnes) {
-        await pool.query('DELETE FROM clients WHERE id = $1', [old.id]);
-        console.log(`ðŸ—‘ï¸  Deleted duplicate: ${old.name} (${old.id}) - Pincode: ${old.pincode}`);
-      }
-      
-      return {
-        duplicatesRemoved: oldOnes.length,
-        keptClientId: newest.id
-      };
-    }
-
-    return { duplicatesRemoved: 0, keptClientId: null };
-  } catch (error) {
-    console.error('Error removing duplicates:', error);
-    return { duplicatesRemoved: 0, keptClientId: null };
-  }
-};
-
-
-
-
-// ============================================
-// TALLY SYNC ROUTES
+// TALLY SYNC ROUTES (NEW IMPLEMENTATION)
 // ============================================
 
-const MIDDLEWARE_TOKEN = process.env.MIDDLEWARE_TOKEN || "tally-middleware-secret-key-12345";
-
-// Verify Middleware Token
-const authenticateMiddleware = (req, res, next) => {
-  const token = req.headers["x-middleware-token"];
-
-  if (!token) {
-    return res.status(401).json({ error: "MiddlewareTokenRequired" });
-  }
-
-  if (token !== MIDDLEWARE_TOKEN) {
-    return res.status(403).json({ error: "InvalidMiddlewareToken" });
-  }
-
-  next();
-};
-
-// SYNC CLIENTS FROM TALLY
 app.post("/api/sync/tally-clients", authenticateMiddleware, async (req, res) => {
   const client = await pool.connect();
   
@@ -1110,10 +934,13 @@ app.post("/api/sync/tally-clients", authenticateMiddleware, async (req, res) => 
     const { clients: tallyClients } = req.body;
 
     if (!tallyClients || !Array.isArray(tallyClients)) {
-      return res.status(400).json({ error: "InvalidPayload", message: "Expected array of clients" });
+      return res.status(400).json({ 
+        error: "InvalidPayload", 
+        message: "Expected array of clients" 
+      });
     }
 
-    console.log(`ðŸ“¥ Tally sync started: ${tallyClients.length} clients received`);
+    console.log(`🔥 Tally sync started: ${tallyClients.length} clients received`);
 
     await client.query("BEGIN");
 
@@ -1122,448 +949,196 @@ app.post("/api/sync/tally-clients", authenticateMiddleware, async (req, res) => 
     let failedCount = 0;
     const errors = [];
 
-    let duplicatesRemovedTotal = 0;
+    for (const tallyClient of tallyClients) {
+      try {
+        const {
+          tally_guid,
+          name,
+          email,
+          phone,
+          address,
+          pincode,
+          latitude,
+          longitude,
+          status = "active",
+          notes,
+          source = "tally"
+        } = tallyClient;
 
-for (const tallyClient of tallyClients) {
-  try {
-    const {
-      tally_guid,
-      name,
-      email,
-      phone,
-      address,
-      pincode,
-      latitude,
-      longitude,
-      status = "active",
-      notes
-    } = tallyClient;
+        if (!name) {
+          failedCount++;
+          errors.push({ tally_guid, error: "Missing name" });
+          continue;
+        }
 
-    if (!name) {
-      failedCount++;
-      errors.push({ tally_guid, error: "Missing name" });
-      continue;
-    }
+        let existingClient = null;
+        
+        if (tally_guid) {
+          const guidResult = await client.query(
+            "SELECT * FROM clients WHERE tally_guid = $1 LIMIT 1",
+            [tally_guid]
+          );
+          if (guidResult.rows.length > 0) {
+            existingClient = guidResult.rows[0];
+          }
+        }
+        
+        if (!existingClient && email) {
+          const emailResult = await client.query(
+            "SELECT * FROM clients WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) LIMIT 1",
+            [email]
+          );
+          if (emailResult.rows.length > 0) {
+            existingClient = emailResult.rows[0];
+          }
+        }
 
-    // Auto-calculate pincode if lat/lng provided
-    let finalPincode = pincode || null;
-    if (!finalPincode && latitude && longitude) {
-      finalPincode = await getPincodeFromCoordinates(latitude, longitude);
-    }
+        if (!existingClient && phone) {
+          const cleanPhone = phone.replace(/\D/g, '');
+          if (cleanPhone.length >= 10) {
+            const phoneResult = await client.query(
+              "SELECT * FROM clients WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 LIMIT 1",
+              [cleanPhone]
+            );
+            if (phoneResult.rows.length > 0) {
+              existingClient = phoneResult.rows[0];
+            }
+          }
+        }
 
-    // ðŸ†• STEP 1: Check and remove duplicates BEFORE inserting/updating
-    // ============================================
-// IMPROVED DUPLICATE DETECTION & CLEANUP
-// ============================================
+        let clientId;
 
-/**
- * Smart duplicate detection that's more conservative
- * Only marks as duplicate if there's HIGH confidence
- */
-const findDuplicates = async (client) => {
-  try {
-    const duplicates = [];
-    
-    // Strategy 1: EXACT GUID match (100% duplicate)
-    if (client.tally_guid) {
-      const guidResult = await pool.query(
-        `SELECT * FROM clients WHERE tally_guid = $1`,
-        [client.tally_guid]
-      );
-      if (guidResult.rows.length > 0) {
-        return guidResult.rows;
+        if (existingClient) {
+          const updateResult = await client.query(
+            `UPDATE clients 
+             SET name = $1, 
+                 email = COALESCE($2, email), 
+                 phone = COALESCE($3, phone), 
+                 address = COALESCE($4, address), 
+                 latitude = COALESCE($5, latitude), 
+                 longitude = COALESCE($6, longitude), 
+                 status = $7, 
+                 notes = COALESCE($8, notes), 
+                 pincode = COALESCE($9, pincode),
+                 tally_guid = COALESCE($10, tally_guid),
+                 source = $11,
+                 updated_at = NOW()
+             WHERE id = $12
+             RETURNING id`,
+            [
+              name, email, phone, address, latitude, longitude, 
+              status, notes, pincode, tally_guid, source, existingClient.id
+            ]
+          );
+          
+          clientId = updateResult.rows[0].id;
+          updatedCount++;
+          console.log(`✏️ Updated: ${name} (${clientId})`);
+
+        } else {
+          const insertResult = await client.query(
+            `INSERT INTO clients 
+             (name, email, phone, address, latitude, longitude, status, notes, 
+              pincode, tally_guid, source, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
+             RETURNING id`,
+            [name, email, phone, address, latitude, longitude, status, notes, 
+             pincode, tally_guid, source]
+          );
+          
+          clientId = insertResult.rows[0].id;
+          newCount++;
+          console.log(`✨ Created: ${name} (${clientId})`);
+        }
+
+        if (tally_guid && clientId) {
+          await client.query(
+            `INSERT INTO tally_client_mapping (tally_ledger_id, client_id, last_synced_at, sync_status)
+             VALUES ($1, $2, NOW(), 'synced')
+             ON CONFLICT (tally_ledger_id) 
+             DO UPDATE SET client_id = $2, last_synced_at = NOW(), sync_status = 'synced'`,
+            [tally_guid, clientId]
+          );
+        }
+
+      } catch (error) {
+        console.error(`❌ Failed to sync ${tallyClient.name}:`, error.message);
+        failedCount++;
+        errors.push({ 
+          tally_guid: tallyClient.tally_guid, 
+          name: tallyClient.name,
+          error: error.message 
+        });
+        
+        if (error.message.includes('duplicate key') || 
+            error.message.includes('violates') ||
+            error.message.includes('constraint')) {
+          console.log(`⚠️ Continuing despite error for ${tallyClient.name}`);
+        }
       }
     }
 
-    // Strategy 2: EXACT email + EXACT phone (very high confidence)
-    if (client.email && client.phone) {
-      const exactResult = await pool.query(
-        `SELECT * FROM clients 
-         WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) 
-         AND phone = $2`,
-        [client.email, client.phone]
-      );
-      if (exactResult.rows.length > 0) {
-        return exactResult.rows;
-      }
-    }
-
-    // Strategy 3: EXACT name + EXACT pincode (high confidence for same area)
-    if (client.name && client.pincode) {
-      const nameResult = await pool.query(
-        `SELECT * FROM clients 
-         WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = 
-               LOWER(TRIM(REGEXP_REPLACE($1, '[^a-zA-Z0-9\\s]', '', 'g')))
-         AND pincode = $2`,
-        [client.name, client.pincode]
-      );
-      if (nameResult.rows.length > 0) {
-        return nameResult.rows;
-      }
-    }
-
-    // Strategy 4: EXACT coordinates (within 10 meters - same building)
-    if (client.latitude && client.longitude) {
-      const locationResult = await pool.query(
-        `SELECT * FROM clients 
-         WHERE latitude IS NOT NULL 
-         AND longitude IS NOT NULL
-         AND (6371000 * acos(
-           cos(radians($1)) * cos(radians(latitude)) * 
-           cos(radians(longitude) - radians($2)) + 
-           sin(radians($1)) * sin(radians(latitude))
-         )) <= 10`,
-        [client.latitude, client.longitude]
-      );
-      if (locationResult.rows.length > 0) {
-        return locationResult.rows;
-      }
-    }
-
-    return duplicates;
-
-  } catch (error) {
-    console.error('Error finding duplicates:', error);
-    return [];
-  }
-};
-
-/**
- * Score clients based on data completeness
- * Higher score = more complete data = keep this one
- */
-const scoreClient = (client) => {
-  let score = 0;
-  
-  if (client.name) score += 10;
-  if (client.email && client.email.includes('@')) score += 15;
-  if (client.phone && client.phone.length >= 10) score += 15;
-  if (client.address && client.address.length > 10) score += 10;
-  if (client.pincode && client.pincode.length === 6) score += 10;
-  if (client.latitude && client.longitude) score += 10;
-  if (client.notes && client.notes.length > 0) score += 5;
-  if (client.tally_guid) score += 20; // Tally GUID is valuable
-  
-  // Bonus for recent data
-  if (client.updated_at) {
-    const daysSinceUpdate = (Date.now() - new Date(client.updated_at)) / (1000 * 60 * 60 * 24);
-    if (daysSinceUpdate < 30) score += 5;
-  }
-  
-  return score;
-};
-
-/**
- * Merge data from multiple duplicate records
- * Takes the best field from each duplicate
- */
-const mergeDuplicateData = (duplicates) => {
-  const merged = { ...duplicates[0] };
-  
-  for (const dup of duplicates) {
-    // Use the most complete email
-    if (!merged.email && dup.email) merged.email = dup.email;
-    if (dup.email && dup.email.includes('@') && (!merged.email || !merged.email.includes('@'))) {
-      merged.email = dup.email;
-    }
-    
-    // Use the longest phone number
-    if (!merged.phone && dup.phone) merged.phone = dup.phone;
-    if (dup.phone && dup.phone.length > (merged.phone?.length || 0)) {
-      merged.phone = dup.phone;
-    }
-    
-    // Use the longest address
-    if (!merged.address && dup.address) merged.address = dup.address;
-    if (dup.address && dup.address.length > (merged.address?.length || 0)) {
-      merged.address = dup.address;
-    }
-    
-    // Prefer pincode from Tally
-    if (!merged.pincode && dup.pincode) merged.pincode = dup.pincode;
-    
-    // Prefer coordinates that exist
-    if (!merged.latitude && dup.latitude) merged.latitude = dup.latitude;
-    if (!merged.longitude && dup.longitude) merged.longitude = dup.longitude;
-    
-    // Keep Tally GUID if available
-    if (!merged.tally_guid && dup.tally_guid) merged.tally_guid = dup.tally_guid;
-    
-    // Combine notes
-    if (dup.notes && dup.notes !== merged.notes) {
-      merged.notes = merged.notes ? `${merged.notes}; ${dup.notes}` : dup.notes;
-    }
-  }
-  
-  return merged;
-};
-
-/**
- * Remove duplicates intelligently
- * Returns: { duplicatesRemoved: number, keptClientId: string }
- */
-const removeDuplicateClients = async (client) => {
-  try {
-    const duplicates = await findDuplicates(client);
-    
-    if (duplicates.length <= 1) {
-      return { duplicatesRemoved: 0, keptClientId: null };
-    }
-
-    console.log(`🔍 Found ${duplicates.length} potential duplicates for: ${client.name}`);
-    
-    // Score each duplicate
-    const scoredDuplicates = duplicates.map(dup => ({
-      ...dup,
-      score: scoreClient(dup)
-    }));
-    
-    // Sort by score (highest first)
-    scoredDuplicates.sort((a, b) => b.score - a.score);
-    
-    // Keep the one with highest score
-    const keepClient = scoredDuplicates[0];
-    const deleteClients = scoredDuplicates.slice(1);
-    
-    console.log(`📊 Scores: Keep ${keepClient.name} (${keepClient.score} pts), Delete ${deleteClients.length} others`);
-    
-    // Merge the best data from all duplicates
-    const mergedData = mergeDuplicateData(scoredDuplicates);
-    
-    // Update the kept client with merged data
-    await pool.query(
-      `UPDATE clients 
-       SET email = $1, phone = $2, address = $3, pincode = $4,
-           latitude = $5, longitude = $6, notes = $7, tally_guid = $8,
-           updated_at = NOW()
-       WHERE id = $9`,
-      [
-        mergedData.email,
-        mergedData.phone,
-        mergedData.address,
-        mergedData.pincode,
-        mergedData.latitude,
-        mergedData.longitude,
-        mergedData.notes,
-        mergedData.tally_guid,
-        keepClient.id
-      ]
-    );
-    
-    console.log(`✅ Merged best data into: ${keepClient.name} (${keepClient.id})`);
-    
-    // Delete the duplicates
-    for (const dup of deleteClients) {
-      await pool.query('DELETE FROM clients WHERE id = $1', [dup.id]);
-      console.log(`🗑️ Deleted duplicate: ${dup.name} (${dup.id}) - Score: ${dup.score}`);
-    }
-    
-    return {
-      duplicatesRemoved: deleteClients.length,
-      keptClientId: keepClient.id
-    };
-
-  } catch (error) {
-    console.error('Error removing duplicates:', error);
-    return { duplicatesRemoved: 0, keptClientId: null };
-  }
-};
-
-// ============================================
-// OPTIONAL: Manual Duplicate Cleanup Route
-// ============================================
-
-/**
- * Run full duplicate cleanup across entire database
- * Use this carefully!
- */
-app.post("/api/sync/cleanup-duplicates", authenticateMiddleware, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    await client.query("BEGIN");
-    
-    // Get all clients
-    const allClients = await client.query("SELECT * FROM clients ORDER BY created_at ASC");
-    
-    let totalRemoved = 0;
-    const processed = new Set();
-    
-    for (const currentClient of allClients.rows) {
-      // Skip if already processed as part of another duplicate group
-      if (processed.has(currentClient.id)) continue;
-      
-      const result = await removeDuplicateClients(currentClient);
-      totalRemoved += result.duplicatesRemoved;
-      
-      // Mark all related duplicates as processed
-      if (result.keptClientId) {
-        processed.add(result.keptClientId);
-      }
-    }
-    
-    await client.query("COMMIT");
-    
-    res.json({
-      message: "DuplicateCleanupCompleted",
-      duplicatesRemoved: totalRemoved,
-      totalProcessed: allClients.rows.length
-    });
-    
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("CLEANUP ERROR:", err);
-    res.status(500).json({ error: "CleanupFailed", message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-    let existingClient = null;
-    
-    // Check Tally mapping
-    if (tally_guid) {
-      const mappingResult = await client.query(
-        "SELECT client_id FROM tally_client_mapping WHERE tally_ledger_id = $1",
-        [tally_guid]
-      );
-      
-      if (mappingResult.rows.length > 0) {
-        const clientId = mappingResult.rows[0].client_id;
-        const clientResult = await client.query(
-          "SELECT * FROM clients WHERE id = $1",
-          [clientId]
-        );
-        existingClient = clientResult.rows[0];
-      }
-    }
-    
-    // Fallback: Check by email
-    if (!existingClient && email) {
-      const emailResult = await client.query(
-        "SELECT * FROM clients WHERE email = $1 LIMIT 1",
-        [email]
-      );
-      if (emailResult.rows.length > 0) {
-        existingClient = emailResult.rows[0];
-      }
-    }
-
-    // Fallback: Check by phone
-    if (!existingClient && phone) {
-      const phoneResult = await client.query(
-        "SELECT * FROM clients WHERE phone = $1 LIMIT 1",
-        [phone]
-      );
-      if (phoneResult.rows.length > 0) {
-        existingClient = phoneResult.rows[0];
-      }
-    }
-
-    let clientId;
-
-    if (existingClient) {
-      // UPDATE existing client
-      const updateResult = await client.query(
-        `UPDATE clients 
-         SET name = $1, email = $2, phone = $3, address = $4, 
-             latitude = $5, longitude = $6, status = $7, notes = $8, pincode = $9,
-             updated_at = NOW()
-         WHERE id = $10
-         RETURNING id`,
-        [name, email, phone, address, latitude, longitude, status, notes, pincode, existingClient.id]
-      );
-      
-      clientId = updateResult.rows[0].id;
-      updatedCount++;
-      console.log(`âœï¸  Updated: ${name} (${clientId}) - Pincode: ${pincode || 'N/A'}`);
-    } else {
-      // INSERT new client
-      const insertResult = await client.query(
-        `INSERT INTO clients 
-         (name, email, phone, address, latitude, longitude, status, notes, pincode, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
-         RETURNING id`,
-        [name, email, phone, address, latitude, longitude, status, notes, pincode]
-      );
-      
-      clientId = insertResult.rows[0].id;
-      newCount++;
-      console.log(`âœ¨ Created: ${name} (${clientId}) - Pincode: ${pincode || 'N/A'}`);
-    }
-
-    // Update Tally mapping
-    if (tally_guid) {
-      await client.query(
-        `INSERT INTO tally_client_mapping (tally_ledger_id, client_id, last_synced_at, sync_status)
-         VALUES ($1, $2, NOW(), 'synced')
-         ON CONFLICT (tally_ledger_id) 
-         DO UPDATE SET client_id = $2, last_synced_at = NOW(), sync_status = 'synced'`,
-        [tally_guid, clientId]
-      );
-    }
-
-  } catch (error) {
-    failedCount++;
-    errors.push({ 
-      tally_guid: tallyClient.tally_guid, 
-      name: tallyClient.name,
-      error: error.message 
-    });
-    console.error(`âŒ Failed to sync client: ${tallyClient.name}`, error.message);
-  }
-}
     await client.query(
       `INSERT INTO tally_sync_log 
-       (sync_started_at, sync_completed_at, total_records, new_records, updated_records, failed_records, errors, status, triggered_by)
+       (sync_started_at, sync_completed_at, total_records, new_records, 
+        updated_records, failed_records, errors, status, triggered_by)
        VALUES (NOW(), NOW(), $1, $2, $3, $4, $5, 'completed', 'middleware')`,
-      [
-        tallyClients.length,
-        newCount,
-        updatedCount,
-        failedCount,
-        JSON.stringify(errors)
-      ]
+      [tallyClients.length, newCount, updatedCount, failedCount, JSON.stringify(errors)]
     );
 
     await client.query("COMMIT");
 
-    // Update this part at the end of the sync route:
-    console.log(`âœ… Tally sync completed: ${newCount} new, ${updatedCount} updated, ${failedCount} failed, ${duplicatesRemovedTotal} duplicates removed`);
+    // ✅ Trigger background geocoding for clients missing location data
+    startBackgroundGeocode();
+
+    console.log(`✅ Tally sync completed:`);
+    console.log(`   📊 Total: ${tallyClients.length}`);
+
+    console.log(`✅ Tally sync completed:`);
+    console.log(`   📊 Total: ${tallyClients.length}`);
+    console.log(`   ✨ New: ${newCount}`);
+    console.log(`   ✏️ Updated: ${updatedCount}`);
+    console.log(`   ❌ Failed: ${failedCount}`);
 
     res.status(200).json({
-    message: "SyncCompleted",
-    summary: {
+      message: "SyncCompleted",
+      summary: {
         total: tallyClients.length,
         new: newCount,
         updated: updatedCount,
-        failed: failedCount,
-        duplicatesRemoved: duplicatesRemovedTotal  // ðŸ†• Add this
-    },
-    errors: errors.length > 0 ? errors : undefined
+        failed: failedCount
+      },
+      errors: errors.length > 0 ? errors : undefined
     });
+
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("TALLY SYNC ERROR:", err);
+    console.error("❌ TALLY SYNC ERROR:", err);
+    console.error("Stack:", err.stack);
     
     try {
-      await client.query(
+      await pool.query(
         `INSERT INTO tally_sync_log 
-         (sync_started_at, sync_completed_at, total_records, failed_records, errors, status, triggered_by)
+         (sync_started_at, sync_completed_at, total_records, failed_records, 
+          errors, status, triggered_by)
          VALUES (NOW(), NOW(), 0, 0, $1, 'failed', 'middleware')`,
-        [JSON.stringify([{ error: err.message }])]
+        [JSON.stringify([{ error: err.message, stack: err.stack }])]
       );
     } catch (logError) {
       console.error("Failed to log sync error:", logError);
     }
     
-    res.status(500).json({ error: "SyncFailed", message: err.message });
+    res.status(500).json({ 
+      error: "SyncFailed", 
+      message: err.message,
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
+
   } finally {
     client.release();
   }
 });
 
-// GET SYNC STATUS
 app.get("/api/sync/status", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1592,7 +1167,6 @@ app.get("/api/sync/status", authenticateToken, async (req, res) => {
   }
 });
 
-// GET LATEST SYNC INFO
 app.get("/api/sync/latest", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1626,7 +1200,6 @@ app.get("/api/sync/latest", authenticateToken, async (req, res) => {
   }
 });
 
-// MANUAL TRIGGER SYNC
 app.post("/api/sync/trigger", authenticateToken, async (req, res) => {
   try {
     await pool.query(
@@ -1646,157 +1219,11 @@ app.post("/api/sync/trigger", authenticateToken, async (req, res) => {
   }
 });
 
-
-
 // ============================================
-// ADMIN ROUTES - Get ALL data (no filtering)
+// ADMIN ROUTES
 // ============================================
 
-// GET ALL CLIENTS (ADMIN - No pincode filter)
-app.get("/admin/clients", authenticateToken, async (req, res) => {
-  try {
-    const { status, search, page = 1, limit = 1000 } = req.query;
-    const offset = (page - 1) * limit;
-
-    console.log(`📊 Admin fetching ALL clients`);
-
-    // Build query - NO PINCODE FILTER
-    let query = "SELECT * FROM clients WHERE 1=1";
-    const params = [];
-    let paramCount = 0;
-
-    // Additional filters
-    if (status) {
-      paramCount++;
-      query += ` AND status = $${paramCount}`;
-      params.push(status);
-    }
-
-    if (search) {
-      paramCount++;
-      query += ` AND (name ILIKE $${paramCount} OR email ILIKE $${paramCount} OR phone ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
-    params.push(limit, offset);
-
-    const result = await pool.query(query, params);
-
-    // Get total count
-    let countQuery = "SELECT COUNT(*) FROM clients WHERE 1=1";
-    const countParams = [];
-    let countParamIndex = 0;
-
-    if (status) {
-      countParamIndex++;
-      countQuery += ` AND status = $${countParamIndex}`;
-      countParams.push(status);
-    }
-
-    const countResult = await pool.query(countQuery, countParams);
-    const total = parseInt(countResult.rows[0].count);
-
-    console.log(`✅ Admin found ${result.rows.length} clients (total: ${total})`);
-
-    res.json({
-      clients: result.rows,
-      isAdmin: true,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: total,
-        totalPages: Math.ceil(total / limit),
-      },
-    });
-  } catch (err) {
-    console.error("GET ADMIN CLIENTS ERROR:", err);
-    res.status(500).json({ error: "GetAdminClientsFailed" });
-  }
-});
-
-// GET ALL USERS (ADMIN)
-app.get("/admin/users", authenticateToken, async (req, res) => {
-  try {
-    const { page = 1, limit = 100 } = req.query;
-    const offset = (page - 1) * limit;
-
-    console.log(`📊 Admin fetching ALL users`);
-
-    const result = await pool.query(
-      `SELECT u.id, u.email, u.created_at, u.pincode,
-              p.full_name, p.department, p.work_hours_start, p.work_hours_end
-       FROM users u
-       LEFT JOIN profiles p ON u.id = p.user_id
-       ORDER BY u.created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
-    );
-
-    const countResult = await pool.query("SELECT COUNT(*) FROM users");
-    const total = parseInt(countResult.rows[0].count);
-
-    console.log(`✅ Admin found ${result.rows.length} users (total: ${total})`);
-
-    res.json({
-      users: result.rows,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: total,
-        totalPages: Math.ceil(total / limit),
-      },
-    });
-  } catch (err) {
-    console.error("GET ADMIN USERS ERROR:", err);
-    res.status(500).json({ error: "GetAdminUsersFailed" });
-  }
-});
-
-// GET ADMIN ANALYTICS (ALL data)
-app.get("/admin/analytics", authenticateToken, async (req, res) => {
-  try {
-    console.log(`📊 Admin fetching analytics`);
-
-    // Get client stats
-    const clientStats = await pool.query(`
-      SELECT 
-        COUNT(*) as total_clients,
-        COUNT(CASE WHEN status = 'active' THEN 1 END) as active_clients,
-        COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 END) as clients_with_location,
-        COUNT(DISTINCT pincode) as unique_pincodes
-      FROM clients
-    `);
-
-    // Get user stats
-    const userStats = await pool.query(`
-      SELECT COUNT(*) as total_users
-      FROM users
-    `);
-
-    // Get location logs count
-    const locationStats = await pool.query(`
-      SELECT COUNT(*) as total_logs
-      FROM location_logs
-    `);
-
-    res.json({
-      clients: clientStats.rows[0],
-      users: userStats.rows[0],
-      locations: locationStats.rows[0],
-    });
-  } catch (err) {
-    console.error("GET ADMIN ANALYTICS ERROR:", err);
-    res.status(500).json({ error: "GetAdminAnalyticsFailed" });
-  }
-});
-
-// ============================================
-// ADMIN ROUTES - Get ALL data (no filtering)
-// ============================================
-
-// GET ALL CLIENTS (ADMIN - No pincode filter)
-app.get("/admin/clients", authenticateToken, async (req, res) => {
+app.get("/admin/clients", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { status, search, page = 1, limit = 1000 } = req.query;
     const offset = (page - 1) * limit;
@@ -1807,17 +1234,17 @@ app.get("/admin/clients", authenticateToken, async (req, res) => {
 
     if (status) {
       paramCount++;
-      query += ` AND status = $${paramCount}`;
+      query += ` AND status = ${paramCount}`;
       params.push(status);
     }
 
     if (search) {
       paramCount++;
-      query += ` AND (name ILIKE $${paramCount} OR email ILIKE $${paramCount})`;
+      query += ` AND (name ILIKE ${paramCount} OR email ILIKE ${paramCount})`;
       params.push(`%${search}%`);
     }
 
-    query += ` ORDER BY created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    query += ` ORDER BY created_at DESC LIMIT ${paramCount + 1} OFFSET ${paramCount + 2}`;
     params.push(limit, offset);
 
     const result = await pool.query(query, params);
@@ -1834,8 +1261,7 @@ app.get("/admin/clients", authenticateToken, async (req, res) => {
   }
 });
 
-// GET ALL USERS (ADMIN)
-app.get("/admin/users", authenticateToken, async (req, res) => {
+app.get("/admin/users", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.email, u.created_at, u.pincode,
@@ -1852,8 +1278,7 @@ app.get("/admin/users", authenticateToken, async (req, res) => {
   }
 });
 
-// GET ADMIN ANALYTICS
-app.get("/admin/analytics", authenticateToken, async (req, res) => {
+app.get("/admin/analytics", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const clientStats = await pool.query(`
       SELECT 
@@ -1885,7 +1310,7 @@ app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (
     const userId = req.params.userId;
 
     const result = await pool.query(
-      `SELECT id, latitude, longitude, accuracy, activity,battery, notes, pincode, timestamp
+      `SELECT id, latitude, longitude, accuracy, activity, battery, notes, pincode, timestamp
        FROM location_logs
        WHERE user_id = $1
        ORDER BY timestamp DESC
@@ -1914,29 +1339,6 @@ app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (
   }
 });
 
-
-app.get("/location-logs/clock-in", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT latitude, longitude, timestamp
-       FROM location_logs
-       WHERE user_id = $1
-         AND DATE(timestamp) = CURRENT_DATE
-       ORDER BY timestamp ASC
-       LIMIT 1`,
-      [req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.json({ clockIn: null });
-    }
-
-    res.json({ clockIn: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: "ClockInFetchFailed" });
-  }
-});
-
 app.get("/admin/clock-status/:userId", authenticateToken, requireAdmin, async (req, res) => {
   const { userId } = req.params;
 
@@ -1953,15 +1355,13 @@ app.get("/admin/clock-status/:userId", authenticateToken, requireAdmin, async (r
   }
 
   const lastSeen = new Date(result.rows[0].timestamp);
-  const isActive = lastSeen >= new Date(Date.now() - 2 * 60 * 1000); // 2 minutes
+  const isActive = lastSeen >= new Date(Date.now() - 2 * 60 * 1000);
 
   res.json({
     clocked_in: isActive,
     last_seen: lastSeen.toISOString()
   });
 });
-
-
 
 app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
   const result = await pool.query(`
@@ -1975,14 +1375,10 @@ app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, 
   res.json({ summary: result.rows });
 });
 
-
-
-
 // ============================================
 // TRIP EXPENSES ROUTES
 // ============================================
 
-// Create expense
 app.post("/expenses", authenticateToken, async (req, res) => {
   try {
     const {
@@ -2029,7 +1425,6 @@ app.post("/expenses", authenticateToken, async (req, res) => {
   }
 });
 
-// ✅ SPECIFIC ROUTES FIRST - Get total expenses (NEW)
 app.get("/expenses/my-total", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2048,7 +1443,6 @@ app.get("/expenses/my-total", authenticateToken, async (req, res) => {
   }
 });
 
-// Get logged-in user's expenses
 app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
   try {
     const { startDate, endDate, transportMode, clientId } = req.query;
@@ -2059,22 +1453,22 @@ app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
 
     if (startDate) {
       count++;
-      query += ` AND travel_date >= $${count}`;
+      query += ` AND travel_date >= ${count}`;
       params.push(startDate);
     }
     if (endDate) {
       count++;
-      query += ` AND travel_date <= $${count}`;
+      query += ` AND travel_date <= ${count}`;
       params.push(endDate);
     }
     if (transportMode) {
       count++;
-      query += ` AND transport_mode = $${count}`;
+      query += ` AND transport_mode = ${count}`;
       params.push(transportMode);
     }
     if (clientId) {
       count++;
-      query += ` AND client_id = $${count}`;
+      query += ` AND client_id = ${count}`;
       params.push(clientId);
     }
 
@@ -2093,7 +1487,6 @@ app.get("/expenses/my-expenses", authenticateToken, async (req, res) => {
   }
 });
 
-// Upload receipt as base64 → returns URL
 app.post("/expenses/receipts", authenticateToken, async (req, res) => {
   try {
     const { imageData, fileName } = req.body;
@@ -2102,12 +1495,10 @@ app.post("/expenses/receipts", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "ImageRequired" });
     }
 
-    // In production, upload to S3 / Cloudinary / Firebase
     const buffer = Buffer.from(imageData, "base64");
     const randomName = `${Date.now()}-${fileName || "receipt.jpg"}`;
     const url = `https://storage.yourdomain.com/receipts/${randomName}`;
 
-    // TODO: Implement actual upload here
     console.log("Receipt upload simulated:", randomName);
 
     res.json({ url, fileName: randomName });
@@ -2117,7 +1508,6 @@ app.post("/expenses/receipts", authenticateToken, async (req, res) => {
   }
 });
 
-// ⚠️ DYNAMIC ROUTES LAST - Get expense by ID
 app.get("/expenses/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2136,7 +1526,6 @@ app.get("/expenses/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Update expense
 app.put("/expenses/:id", authenticateToken, async (req, res) => {
   try {
     const {
@@ -2197,7 +1586,6 @@ app.put("/expenses/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Delete expense
 app.delete("/expenses/:id", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2216,8 +1604,28 @@ app.delete("/expenses/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Start server
+// ============================================
+// UTILITY ROUTES
+// ============================================
+
+app.get("/", (req, res) => {
+  res.json({ message: "Client Tracking API with Pincode Filtering" });
+});
+
+app.get("/dbtest", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json({ db_time: result.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
 app.listen(PORT, () => {
-  console.log(`ðŸš€ Server running on http://localhost:${PORT}`);
-  console.log(`ðŸ“ Pincode-based filtering enabled`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📍 Pincode-based filtering enabled`);
 });
