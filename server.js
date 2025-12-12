@@ -1,3 +1,4 @@
+
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -44,7 +45,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 const getPincodeFromCoordinates = async (latitude, longitude) => {
   try {
     const response = await fetch(
-      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${GOOGLE_MAPS_API_KEY}`
+      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}%region=in&key=${GOOGLE_MAPS_API_KEY}`
     );
     
     const data = await response.json();
@@ -70,7 +71,7 @@ const getPincodeFromCoordinates = async (latitude, longitude) => {
 
 async function getCoordinatesFromPincode(pincode) {
   try {
-    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${pincode}&key=${GOOGLE_MAPS_API_KEY}`;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${pincode}&region=in&key=${GOOGLE_MAPS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
     if (data.status !== "OK") return null;
@@ -1220,7 +1221,7 @@ app.post("/api/sync/trigger", authenticateToken, async (req, res) => {
 });
 
 // ============================================
-// ADMIN ROUTES
+// ADMIN ROUTES (FIXED VERSION)
 // ============================================
 
 app.get("/admin/clients", authenticateToken, requireAdmin, async (req, res) => {
@@ -1234,47 +1235,60 @@ app.get("/admin/clients", authenticateToken, requireAdmin, async (req, res) => {
 
     if (status) {
       paramCount++;
-      query += ` AND status = ${paramCount}`;
+      query += ` AND status = $${paramCount}`;
       params.push(status);
     }
 
     if (search) {
       paramCount++;
-      query += ` AND (name ILIKE ${paramCount} OR email ILIKE ${paramCount})`;
+      query += ` AND (name ILIKE $${paramCount} OR email ILIKE $${paramCount})`;
       params.push(`%${search}%`);
     }
 
-    query += ` ORDER BY created_at DESC LIMIT ${paramCount + 1} OFFSET ${paramCount + 2}`;
+    query += ` ORDER BY created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
     params.push(limit, offset);
 
     const result = await pool.query(query, params);
     const countResult = await pool.query("SELECT COUNT(*) FROM clients");
     const total = parseInt(countResult.rows[0].count);
 
+    console.log(`✅ Admin fetched ${result.rows.length} clients`);
+
     res.json({
       clients: result.rows,
-      pagination: { page: parseInt(page), limit: parseInt(limit), total, totalPages: Math.ceil(total / limit) }
+      pagination: { 
+        page: parseInt(page), 
+        limit: parseInt(limit), 
+        total, 
+        totalPages: Math.ceil(total / limit) 
+      }
     });
   } catch (err) {
     console.error("ADMIN CLIENTS ERROR:", err);
-    res.status(500).json({ error: "GetAdminClientsFailed" });
+    res.status(500).json({ error: "GetAdminClientsFailed", message: err.message });
   }
 });
 
 app.get("/admin/users", authenticateToken, requireAdmin, async (req, res) => {
   try {
+    const { limit = 1000 } = req.query;
+    
     const result = await pool.query(
       `SELECT u.id, u.email, u.created_at, u.pincode,
               p.full_name, p.department, p.work_hours_start, p.work_hours_end
        FROM users u
        LEFT JOIN profiles p ON u.id = p.user_id
-       ORDER BY u.created_at DESC`
+       ORDER BY u.created_at DESC
+       LIMIT $1`,
+      [limit]
     );
+
+    console.log(`✅ Admin fetched ${result.rows.length} users`);
 
     res.json({ users: result.rows });
   } catch (err) {
     console.error("ADMIN USERS ERROR:", err);
-    res.status(500).json({ error: "GetAdminUsersFailed" });
+    res.status(500).json({ error: "GetAdminUsersFailed", message: err.message });
   }
 });
 
@@ -1284,13 +1298,15 @@ app.get("/admin/analytics", authenticateToken, requireAdmin, async (req, res) =>
       SELECT 
         COUNT(*) as total_clients,
         COUNT(CASE WHEN status = 'active' THEN 1 END) as active_clients,
-        COUNT(CASE WHEN latitude IS NOT NULL THEN 1 END) as clients_with_location,
-        COUNT(DISTINCT pincode) as unique_pincodes
+        COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 END) as clients_with_location,
+        COUNT(DISTINCT pincode) FILTER (WHERE pincode IS NOT NULL) as unique_pincodes
       FROM clients
     `);
 
     const userStats = await pool.query(`SELECT COUNT(*) as total_users FROM users`);
     const locationStats = await pool.query(`SELECT COUNT(*) as total_logs FROM location_logs`);
+
+    console.log("✅ Admin analytics fetched successfully");
 
     res.json({
       clients: clientStats.rows[0],
@@ -1299,7 +1315,7 @@ app.get("/admin/analytics", authenticateToken, requireAdmin, async (req, res) =>
     });
   } catch (err) {
     console.error("ADMIN ANALYTICS ERROR:", err);
-    res.status(500).json({ error: "GetAdminAnalyticsFailed" });
+    res.status(500).json({ error: "GetAdminAnalyticsFailed", message: err.message });
   }
 });
 
@@ -1323,6 +1339,8 @@ app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (
       [userId]
     );
 
+    console.log(`✅ Fetched ${result.rows.length} logs for user ${userId}`);
+
     res.json({
       logs: result.rows,
       pagination: {
@@ -1335,45 +1353,85 @@ app.get("/admin/location-logs/:userId", authenticateToken, requireAdmin, async (
 
   } catch (err) {
     console.error("GET ADMIN LOCATION LOGS ERROR:", err);
-    res.status(500).json({ error: "GetAdminLocationLogsFailed" });
+    res.status(500).json({ error: "GetAdminLocationLogsFailed", message: err.message });
   }
 });
 
 app.get("/admin/clock-status/:userId", authenticateToken, requireAdmin, async (req, res) => {
-  const { userId } = req.params;
+  try {
+    const { userId } = req.params;
 
-  const result = await pool.query(`
-    SELECT l.timestamp
-    FROM location_logs l
-    WHERE l.user_id = $1
-    ORDER BY l.timestamp DESC
-    LIMIT 1;
-  `, [userId]);
+    const result = await pool.query(`
+      SELECT timestamp
+      FROM location_logs
+      WHERE user_id = $1
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `, [userId]);
 
-  if (result.rows.length === 0) {
-    return res.json({ clocked_in: false, last_seen: null });
+    if (result.rows.length === 0) {
+      return res.json({ clocked_in: false, last_seen: null });
+    }
+
+    const lastSeen = new Date(result.rows[0].timestamp);
+    const now = new Date();
+    const diffMinutes = (now - lastSeen) / (1000 * 60);
+    
+    // Consider active if logged location within last 5 minutes
+    const isActive = diffMinutes <= 5;
+
+    res.json({
+      clocked_in: isActive,
+      last_seen: lastSeen.toISOString()
+    });
+  } catch (err) {
+    console.error("GET CLOCK STATUS ERROR:", err);
+    res.status(500).json({ error: "GetClockStatusFailed", message: err.message });
   }
-
-  const lastSeen = new Date(result.rows[0].timestamp);
-  const isActive = lastSeen >= new Date(Date.now() - 2 * 60 * 1000);
-
-  res.json({
-    clocked_in: isActive,
-    last_seen: lastSeen.toISOString()
-  });
 });
 
 app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, res) => {
-  const result = await pool.query(`
-    SELECT u.id,
-      COALESCE(SUM(e.amount_spent), 0) AS total_expense
-    FROM users u
-    LEFT JOIN trip_expenses e ON e.user_id = u.id
-    GROUP BY u.id;
-  `);
+  try {
+    const result = await pool.query(`
+      SELECT 
+        u.id,
+        COALESCE(SUM(e.amount_spent), 0) AS total_expense
+      FROM users u
+      LEFT JOIN trip_expenses e ON e.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.id
+    `);
 
-  res.json({ summary: result.rows });
+    console.log(`✅ Fetched expense summary for ${result.rows.length} users`);
+
+    res.json({ summary: result.rows });
+  } catch (err) {
+    console.error("GET EXPENSES SUMMARY ERROR:", err);
+    res.status(500).json({ error: "GetExpensesSummaryFailed", message: err.message });
+  }
 });
+
+// Optional: Add a route to check admin status
+app.get("/admin/check", authenticateToken, (req, res) => {
+  res.json({ 
+    isAdmin: req.user.isAdmin || false,
+    userId: req.user.id,
+    email: req.user.email
+  });
+});
+
+// Optional: Debug route to verify token
+app.get("/auth/verify", authenticateToken, (req, res) => {
+  res.json({
+    authenticated: true,
+    user: {
+      id: req.user.id,
+      email: req.user.email,
+      isAdmin: req.user.isAdmin || false
+    }
+  });
+});
+
 
 // ============================================
 // TRIP EXPENSES ROUTES
@@ -1601,6 +1659,390 @@ app.delete("/expenses/:id", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("DELETE EXPENSE ERROR:", err);
     res.status(500).json({ error: "DeleteExpenseFailed" });
+  }
+});
+
+
+// ============================================
+// MEETINGS ROUTES
+// ============================================
+
+// Start a new meeting
+app.post("/meetings", authenticateToken, async (req, res) => {
+  try {
+    const { clientId, latitude, longitude, accuracy } = req.body;
+
+    if (!clientId) {
+      return res.status(400).json({ error: "ClientIdRequired" });
+    }
+
+    // Check if there's already an active meeting for this client
+    const existingMeeting = await pool.query(
+      `SELECT id FROM meetings 
+       WHERE client_id = $1 
+       AND user_id = $2 
+       AND status = 'IN_PROGRESS'
+       LIMIT 1`,
+      [clientId, req.user.id]
+    );
+
+    if (existingMeeting.rows.length > 0) {
+      return res.status(400).json({ 
+        error: "ActiveMeetingExists",
+        message: "You already have an active meeting with this client"
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO meetings 
+       (user_id, client_id, start_time, start_latitude, start_longitude, start_accuracy, status)
+       VALUES ($1, $2, NOW(), $3, $4, $5, 'IN_PROGRESS')
+       RETURNING 
+         id,
+         user_id as "userId",
+         client_id as "clientId",
+         start_time as "startTime",
+         end_time as "endTime",
+         start_latitude as "startLatitude",
+         start_longitude as "startLongitude",
+         start_accuracy as "startAccuracy",
+         end_latitude as "endLatitude",
+         end_longitude as "endLongitude",
+         end_accuracy as "endAccuracy",
+         status,
+         comments,
+         attachments,
+         created_at as "createdAt",
+         updated_at as "updatedAt"`,
+      [req.user.id, clientId, latitude || null, longitude || null, accuracy || null]
+    );
+
+    console.log(`✅ Meeting started: ${result.rows[0].id} for client ${clientId}`);
+
+    res.status(201).json({
+      message: "MeetingStarted",
+      meeting: result.rows[0]
+    });
+  } catch (err) {
+    console.error("START MEETING ERROR:", err);
+    res.status(500).json({ error: "StartMeetingFailed" });
+  }
+});
+
+// Get active meeting for a client
+app.get("/meetings/active/:clientId", authenticateToken, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+
+    const result = await pool.query(
+      `SELECT 
+         id,
+         user_id as "userId",
+         client_id as "clientId",
+         start_time as "startTime",
+         end_time as "endTime",
+         start_latitude as "startLatitude",
+         start_longitude as "startLongitude",
+         start_accuracy as "startAccuracy",
+         end_latitude as "endLatitude",
+         end_longitude as "endLongitude",
+         end_accuracy as "endAccuracy",
+         status,
+         comments,
+         attachments,
+         created_at as "createdAt",
+         updated_at as "updatedAt"
+       FROM meetings
+       WHERE client_id = $1 
+       AND user_id = $2 
+       AND status = 'IN_PROGRESS'
+       ORDER BY start_time DESC
+       LIMIT 1`,
+      [clientId, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ meeting: null });
+    }
+
+    res.json({ meeting: result.rows[0] });
+  } catch (err) {
+    console.error("GET ACTIVE MEETING ERROR:", err);
+    res.status(500).json({ error: "GetActiveMeetingFailed" });
+  }
+});
+
+// End/update a meeting
+app.put("/meetings/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { endTime, status, comments, attachments, latitude, longitude, accuracy } = req.body;
+
+    // Verify meeting belongs to user
+    const checkResult = await pool.query(
+      `SELECT id FROM meetings WHERE id = $1 AND user_id = $2`,
+      [id, req.user.id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: "MeetingNotFound" });
+    }
+
+    const result = await pool.query(
+      `UPDATE meetings
+       SET end_time = COALESCE($1, end_time, NOW()),
+           end_latitude = COALESCE($2, end_latitude),
+           end_longitude = COALESCE($3, end_longitude),
+           end_accuracy = COALESCE($4, end_accuracy),
+           status = COALESCE($5, status),
+           comments = COALESCE($6, comments),
+           attachments = COALESCE($7, attachments),
+           updated_at = NOW()
+       WHERE id = $8
+       RETURNING 
+         id,
+         user_id as "userId",
+         client_id as "clientId",
+         start_time as "startTime",
+         end_time as "endTime",
+         start_latitude as "startLatitude",
+         start_longitude as "startLongitude",
+         start_accuracy as "startAccuracy",
+         end_latitude as "endLatitude",
+         end_longitude as "endLongitude",
+         end_accuracy as "endAccuracy",
+         status,
+         comments,
+         attachments,
+         created_at as "createdAt",
+         updated_at as "updatedAt"`,
+      [
+        endTime || null,
+        latitude || null,
+        longitude || null,
+        accuracy || null,
+        status || 'COMPLETED',
+        comments || null,
+        attachments ? JSON.stringify(attachments) : null,
+        id
+      ]
+    );
+
+    console.log(`✅ Meeting ended: ${id}`);
+
+    res.json({
+      message: "MeetingUpdated",
+      meeting: result.rows[0]
+    });
+  } catch (err) {
+    console.error("UPDATE MEETING ERROR:", err);
+    res.status(500).json({ error: "UpdateMeetingFailed" });
+  }
+});
+
+// Upload meeting attachment
+app.post("/meetings/:id/attachments", authenticateToken, upload.single("file"), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "NoFileUploaded" });
+    }
+
+    // Verify meeting belongs to user
+    const checkResult = await pool.query(
+      `SELECT id FROM meetings WHERE id = $1 AND user_id = $2`,
+      [id, req.user.id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: "MeetingNotFound" });
+    }
+
+    // In production, upload to S3/Cloud Storage
+    // For now, we'll simulate and return a mock URL
+    const fileName = `${Date.now()}-${req.file.originalname}`;
+    const fileUrl = `https://storage.yourdomain.com/meetings/${fileName}`;
+
+    console.log(`📎 Meeting attachment uploaded: ${fileName} (${req.file.size} bytes)`);
+
+    // Get current attachments
+    const currentResult = await pool.query(
+      `SELECT attachments FROM meetings WHERE id = $1`,
+      [id]
+    );
+
+    const currentAttachments = currentResult.rows[0]?.attachments || [];
+    const updatedAttachments = [...currentAttachments, fileUrl];
+
+    // Update meeting with new attachment
+    await pool.query(
+      `UPDATE meetings 
+       SET attachments = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify(updatedAttachments), id]
+    );
+
+    res.json({
+      message: "AttachmentUploaded",
+      url: fileUrl,
+      fileName: fileName
+    });
+  } catch (err) {
+    console.error("UPLOAD ATTACHMENT ERROR:", err);
+    res.status(500).json({ error: "UploadAttachmentFailed" });
+  }
+});
+
+// Get all meetings for a user (with optional filters)
+app.get("/meetings", authenticateToken, async (req, res) => {
+  try {
+    const { clientId, status, startDate, endDate, page = 1, limit = 50 } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = `
+      SELECT 
+        m.id,
+        m.user_id as "userId",
+        m.client_id as "clientId",
+        m.start_time as "startTime",
+        m.end_time as "endTime",
+        m.start_latitude as "startLatitude",
+        m.start_longitude as "startLongitude",
+        m.start_accuracy as "startAccuracy",
+        m.end_latitude as "endLatitude",
+        m.end_longitude as "endLongitude",
+        m.end_accuracy as "endAccuracy",
+        m.status,
+        m.comments,
+        m.attachments,
+        m.created_at as "createdAt",
+        m.updated_at as "updatedAt",
+        c.name as "clientName",
+        c.address as "clientAddress"
+      FROM meetings m
+      LEFT JOIN clients c ON m.client_id = c.id
+      WHERE m.user_id = $1
+    `;
+    const params = [req.user.id];
+    let paramCount = 1;
+
+    if (clientId) {
+      paramCount++;
+      query += ` AND m.client_id = $${paramCount}`;
+      params.push(clientId);
+    }
+
+    if (status) {
+      paramCount++;
+      query += ` AND m.status = $${paramCount}`;
+      params.push(status);
+    }
+
+    if (startDate) {
+      paramCount++;
+      query += ` AND m.start_time >= $${paramCount}`;
+      params.push(startDate);
+    }
+
+    if (endDate) {
+      paramCount++;
+      query += ` AND m.start_time <= $${paramCount}`;
+      params.push(endDate);
+    }
+
+    query += ` ORDER BY m.start_time DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+
+    const result = await pool.query(query, params);
+
+    // Get total count
+    let countQuery = "SELECT COUNT(*) FROM meetings WHERE user_id = $1";
+    const countParams = [req.user.id];
+    const countResult = await pool.query(countQuery, countParams);
+    const total = parseInt(countResult.rows[0].count);
+
+    res.json({
+      meetings: result.rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (err) {
+    console.error("GET MEETINGS ERROR:", err);
+    res.status(500).json({ error: "GetMeetingsFailed" });
+  }
+});
+
+// Get single meeting by ID
+app.get("/meetings/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT 
+         m.id,
+         m.user_id as "userId",
+         m.client_id as "clientId",
+         m.start_time as "startTime",
+         m.end_time as "endTime",
+         m.start_latitude as "startLatitude",
+         m.start_longitude as "startLongitude",
+         m.start_accuracy as "startAccuracy",
+         m.end_latitude as "endLatitude",
+         m.end_longitude as "endLongitude",
+         m.end_accuracy as "endAccuracy",
+         m.status,
+         m.comments,
+         m.attachments,
+         m.created_at as "createdAt",
+         m.updated_at as "updatedAt",
+         c.name as "clientName",
+         c.email as "clientEmail",
+         c.phone as "clientPhone",
+         c.address as "clientAddress"
+       FROM meetings m
+       LEFT JOIN clients c ON m.client_id = c.id
+       WHERE m.id = $1 AND m.user_id = $2`,
+      [id, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "MeetingNotFound" });
+    }
+
+    res.json({ meeting: result.rows[0] });
+  } catch (err) {
+    console.error("GET MEETING ERROR:", err);
+    res.status(500).json({ error: "GetMeetingFailed" });
+  }
+});
+
+// Delete a meeting (optional - might want to soft delete instead)
+app.delete("/meetings/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `DELETE FROM meetings 
+       WHERE id = $1 AND user_id = $2 
+       RETURNING id`,
+      [id, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "MeetingNotFound" });
+    }
+
+    console.log(`🗑️ Meeting deleted: ${id}`);
+
+    res.json({ message: "MeetingDeleted" });
+  } catch (err) {
+    console.error("DELETE MEETING ERROR:", err);
+    res.status(500).json({ error: "DeleteMeetingFailed" });
   }
 });
 
