@@ -1,4 +1,3 @@
-
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -45,7 +44,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 const getPincodeFromCoordinates = async (latitude, longitude) => {
   try {
     const response = await fetch(
-      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}%region=in&key=${GOOGLE_MAPS_API_KEY}`
+      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&region=in&key=${GOOGLE_MAPS_API_KEY}`
     );
     
     const data = await response.json();
@@ -1411,6 +1410,132 @@ app.get("/admin/expenses/summary", authenticateToken, requireAdmin, async (req, 
   }
 });
 
+// ----------------------------------------------
+// ADMIN: GET PAGINATED USER MEETINGS
+// ----------------------------------------------
+app.get("/admin/user-meetings/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.userId;
+
+    // Pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    // Count total meetings (for pagination UI)
+    const totalCountResult = await pool.query(
+      `SELECT COUNT(*) FROM meetings WHERE user_id = $1`,
+      [userId]
+    );
+    const totalCount = parseInt(totalCountResult.rows[0].count);
+
+    // Fetch paginated meetings + joined client data
+    const result = await pool.query(
+      `SELECT 
+         m.id,
+         m.user_id AS "userId",
+         m.client_id AS "clientId",
+         m.start_time AS "startTime",
+         m.end_time AS "endTime",
+         m.start_latitude AS "startLatitude",
+         m.start_longitude AS "startLongitude",
+         m.start_accuracy AS "startAccuracy",
+         m.end_latitude AS "endLatitude",
+         m.end_longitude AS "endLongitude",
+         m.end_accuracy AS "endAccuracy",
+         m.status,
+         m.comments,
+         m.attachments,
+         m.created_at AS "createdAt",
+         m.updated_at AS "updatedAt",
+         c.name AS "clientName",
+         c.address AS "clientAddress"
+       FROM meetings m
+       LEFT JOIN clients c ON m.client_id = c.id
+       WHERE m.user_id = $1
+       ORDER BY m.start_time DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+
+    console.log(`Fetched ${result.rows.length} meetings for user ${userId}`);
+
+    res.json({
+      meetings: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / limit),
+      },
+    });
+
+  } catch (err) {
+    console.error("GET ADMIN USER MEETINGS ERROR:", err);
+    res.status(500).json({
+      error: "GetAdminUserMeetingsFailed",
+      message: err.message,
+    });
+  }
+});
+
+// ----------------------------------------------
+// ADMIN: GET EXPENSE LOGS FOR A USER (PAGINATED)
+// ----------------------------------------------
+app.get("/admin/user-expenses/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+
+    const totalResult = await pool.query(
+      `SELECT COUNT(*) FROM trip_expenses WHERE user_id = $1`,
+      [userId]
+    );
+    const total = parseInt(totalResult.rows[0].count);
+
+    const logsResult = await pool.query(
+      `SELECT 
+         id,
+         user_id AS "userId",
+         start_location AS "startLocation",
+         end_location AS "endLocation",
+         travel_date AS "travelDate",
+         distance_km AS "distanceKm",
+         transport_mode AS "transportMode",
+         amount_spent AS "amountSpent",
+         currency,
+         notes,
+         receipt_urls AS "receiptUrls",
+         client_id AS "clientId",
+         created_at AS "createdAt",
+         updated_at AS "updatedAt"
+       FROM trip_expenses
+       WHERE user_id = $1
+       ORDER BY travel_date DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+
+    res.json({
+      expenses: logsResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (err) {
+    console.error("GET ADMIN USER EXPENSE LOGS ERROR:", err);
+    res.status(500).json({ error: "GetAdminUserExpenseLogsFailed" });
+  }
+});
+
+
+
+
 // Optional: Add a route to check admin status
 app.get("/admin/check", authenticateToken, (req, res) => {
   res.json({ 
@@ -1431,6 +1556,8 @@ app.get("/auth/verify", authenticateToken, (req, res) => {
     }
   });
 });
+
+
 
 
 // ============================================
@@ -2043,6 +2170,61 @@ app.delete("/meetings/:id", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("DELETE MEETING ERROR:", err);
     res.status(500).json({ error: "DeleteMeetingFailed" });
+  }
+});
+
+// ==========================
+// GET USER EXPENSES (Paginated)
+// ==========================
+app.get("/admin/user-expenses/:userId", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    // Count total expenses
+    const totalCount = await pool.query(
+      `SELECT COUNT(*) FROM trip_expenses WHERE user_id = $1`,
+      [userId]
+    );
+
+    // Fetch expenses - EXACT column names from your schema
+    const result = await pool.query(
+      `SELECT
+        id,
+        user_id as "userId",
+        start_location as "startLocation",
+        end_location as "endLocation",
+        travel_date as "travelDate",
+        distance_km as "distanceKm",
+        transport_mode as "transportMode",
+        amount_spent as "amountSpent",
+        currency,
+        notes,
+        receipt_urls as "receiptUrls",
+        client_id as "clientId",
+        created_at as "createdAt",
+        updated_at as "updatedAt"
+       FROM trip_expenses
+       WHERE user_id = $1
+       ORDER BY travel_date DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+    res.json({
+      expenses: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: Number(totalCount.rows[0].count),
+        totalPages: Math.ceil(Number(totalCount.rows[0].count) / limit)
+      }
+    });
+
+  } catch (err) {
+    console.error("GET USER EXPENSES ERROR:", err);
+    res.status(500).json({ error: "GetUserExpensesFailed", message: err.message });
   }
 });
 
