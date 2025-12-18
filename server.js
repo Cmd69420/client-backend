@@ -424,6 +424,10 @@ app.post("/auth/clear-pincode", authenticateToken, async (req, res) => {
 // CLIENTS ROUTES
 // ============================================
 
+// Replace the entire Excel upload route in your server.js
+// Starting from app.post("/clients/upload-excel", ...)
+// Replace the entire duplicate checking section in your Excel upload route
+
 app.post(
   "/clients/upload-excel",
   authenticateToken,
@@ -461,7 +465,14 @@ app.post(
       for (const row of rows) {
         const name = row.name || row.Name || null;
         const email = row.email || row.Email || null;
-        const phone = row.phone || row.Phone || null;
+        
+        let phone = row.phone || row.Phone || null;
+        if (phone !== null && phone !== undefined && phone !== '') {
+          phone = String(phone).trim().replace(/\s+/g, '');
+        } else {
+          phone = null;
+        }
+        
         const address = row.address || row.Address || null;
         const note = row.note || row.Note || row.notes || row.Notes || null;
         const status = row.status || row.Status || 'active';
@@ -483,19 +494,25 @@ app.post(
 
         if (row.pincode || row.Pincode) {
           pincode = String(row.pincode || row.Pincode).trim();
+          if (pincode.includes('.')) {
+            pincode = pincode.split('.')[0];
+          }
         }
 
         if (!name || !address) {
+          console.log(`⚠️ Skipping row: missing name or address`);
           skipped++;
           continue;
         }
 
+        // Geocode if needed
         if (pincode && (!latitude || !longitude)) {
           try {
             const geo = await getCoordinatesFromPincode(pincode);
             if (geo) {
               latitude = geo.latitude;
               longitude = geo.longitude;
+              console.log(`🔍 Geocoded ${name} from pincode ${pincode}`);
             }
           } catch (err) {
             console.log(`⚠️ Geocoding failed for pincode ${pincode}`);
@@ -509,31 +526,43 @@ app.post(
               latitude = latitude ?? geo.latitude;
               longitude = longitude ?? geo.longitude;
               pincode = pincode ?? geo.pincode;
+              console.log(`🔍 Geocoded ${name} from address`);
             }
           } catch (err) {
-            console.log(`⚠️ Geocoding failed for address`);
+            console.log(`⚠️ Geocoding failed for address: ${address}`);
           }
         }
 
+        // ========== ✅ FIXED DUPLICATE CHECKING (USER-SPECIFIC) ==========
         let duplicateCheck = { rows: [] };
         
+        // Check 1: By email (for THIS USER only)
         if (email) {
           duplicateCheck = await client.query(
-            `SELECT id FROM clients WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) LIMIT 1`,
-            [email]
+            `SELECT id FROM clients 
+             WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) 
+             AND created_by = $2 
+             LIMIT 1`,
+            [email, req.user.id]
           );
         }
         
+        // Check 2: By phone (for THIS USER only)
         if (duplicateCheck.rows.length === 0 && phone) {
           const cleanPhone = phone.replace(/\D/g, '');
-          duplicateCheck = await client.query(
-            `SELECT id FROM clients 
-             WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 
-             LIMIT 1`,
-            [cleanPhone]
-          );
+          
+          if (cleanPhone.length >= 10) {
+            duplicateCheck = await client.query(
+              `SELECT id FROM clients 
+               WHERE REGEXP_REPLACE(phone, '\\D', '', 'g') = $1 
+               AND created_by = $2
+               LIMIT 1`,
+              [cleanPhone, req.user.id]
+            );
+          }
         }
         
+        // Check 3: By name + pincode (for THIS USER only)
         if (duplicateCheck.rows.length === 0) {
           const cleanName = name.toLowerCase().trim().replace(/[^a-z0-9\s]/g, '');
           
@@ -542,20 +571,24 @@ app.post(
               `SELECT id FROM clients 
                WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1 
                AND pincode = $2
+               AND created_by = $3
                LIMIT 1`,
-              [cleanName, pincode]
+              [cleanName, pincode, req.user.id]
             );
           } else {
             duplicateCheck = await client.query(
               `SELECT id FROM clients 
                WHERE LOWER(TRIM(REGEXP_REPLACE(name, '[^a-zA-Z0-9\\s]', '', 'g'))) = $1
+               AND created_by = $2
                LIMIT 1`,
-              [cleanName]
+              [cleanName, req.user.id]
             );
           }
         }
 
+        // ========== UPDATE OR INSERT (Only user's own records) ==========
         if (duplicateCheck.rows.length > 0) {
+          // Update THIS USER's existing client
           const existingId = duplicateCheck.rows[0].id;
           
           await client.query(
@@ -570,13 +603,15 @@ app.post(
                notes = COALESCE($7, notes),
                status = $8,
                updated_at = NOW()
-             WHERE id = $9`,
-            [email, phone, address, latitude, longitude, pincode, note, status, existingId]
+             WHERE id = $9 AND created_by = $10`,
+            [email, phone, address, latitude, longitude, pincode, note, status, existingId, req.user.id]
           );
 
           updated++;
-          console.log(`📄 Updated: ${name} (ID: ${existingId})`);
+          console.log(`🔄 Updated: ${name} (ID: ${existingId}) for user ${req.user.id}`);
+          
         } else {
+          // Insert new client for THIS USER
           await client.query(
             `INSERT INTO clients
              (name, email, phone, address, latitude, longitude, status, notes, created_by, source, pincode)
@@ -585,7 +620,7 @@ app.post(
           );
 
           imported++;
-          console.log(`✅ Imported: ${name}`);
+          console.log(`✅ Imported: ${name} for user ${req.user.id}`);
         }
       }
 
@@ -608,6 +643,8 @@ app.post(
     } catch (error) {
       await client.query("ROLLBACK");
       console.error("❌ Upload error:", error);
+      console.error("Stack trace:", error.stack);
+      
       res.status(500).json({ 
         error: "UploadFailed", 
         message: error.message 
